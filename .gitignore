@@ -1,0 +1,8 @@
+# secrets / runtime — never commit
+config.env
+state.json
+*.tmp
+
+# python
+__pycache__/
+*.pyc

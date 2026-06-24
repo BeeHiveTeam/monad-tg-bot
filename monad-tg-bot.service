@@ -1,0 +1,17 @@
+[Unit]
+Description=Monad node Telegram bot (monitoring + on-demand commands)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 /opt/monad-tg-bot/bot.py
+Restart=always
+RestartSec=10
+# не валит сервис при временной потере сети — Restart=always поднимет
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
