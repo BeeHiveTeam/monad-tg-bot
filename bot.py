@@ -316,6 +316,8 @@ def monitor(st):
     save_state(st)
 
 # ---------- command handling ----------
+CB_SEEN = {}  # (cid:data) -> ts последнего исполнения кнопки, для дебаунса
+
 def dispatch(cid, cmd):
     # общий диспетчер для /команд и нажатий кнопок
     if cmd == "status":   send(cid, fmt_status(), kb=True)
@@ -351,16 +353,22 @@ def handle_callback(cb):
     r = tg("answerCallbackQuery", {"callback_query_id": cb.get("id", "")}, timeout=15)
     sys.stderr.write("callback data=%s answer_ok=%s answer_took=%.1fs\n"
                      % (cb.get("data"), (r or {}).get("ok"), time.time() - t0))
-    if r is not None and not r.get("ok") and r.get("error_code") == 400:
-        # колбэк ПРОТУХ (Telegram принимает ответ ~15-30с после нажатия):
-        # не шлём запоздалый ответ, чтобы не спамить чат. Сетевой сбой (r is None)
-        # протуханием НЕ считаем — отвечаем как обычно, лучше поздно, чем никогда.
-        return
     if cid not in ALLOWED:
         send(cid, "⛔ Не авторизован. Твой chat_id: %s" % cid)
         return
+    # дебаунс: та же кнопка не чаще раза в 10с — гасит спам при серии нажатий
+    # и при пачке протухших колбэков после залипания доставки. Отвечаем ВСЕГДА,
+    # даже если "часики" погасить не удалось (Telegram бывает тормозит сам ответ
+    # на answerCallbackQuery на 10-15с и потом отдаёт "query is too old").
+    data = (cb.get("data") or "").strip().lower()
+    key = cid + ":" + data
+    now = time.time()
+    if now - CB_SEEN.get(key, 0) < 10:
+        sys.stderr.write("debounce %s\n" % key)
+        return
+    CB_SEEN[key] = now
     t1 = time.time()
-    dispatch(cid, (cb.get("data") or "").strip().lower())
+    dispatch(cid, data)
     sys.stderr.write("dispatch %s took=%.1fs\n" % (cb.get("data"), time.time() - t1))
 
 # ---------- main loop ----------
