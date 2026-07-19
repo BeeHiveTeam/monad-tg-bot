@@ -51,6 +51,16 @@ def tg(method, params=None, timeout=35):
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=SSLCTX) as r:
             return json.load(r)
+    except urllib.error.HTTPError as e:
+        # тело ошибки Telegram содержит error_code/description — отдаём наверх,
+        # чтобы отличать "колбэк протух" (400) от сетевых сбоев (None)
+        try:
+            body = json.load(e)
+        except Exception:
+            body = {"ok": False, "error_code": e.code}
+        sys.stderr.write("tg %s error: %s %s\n" % (method, e, body.get("description", "")))
+        sys.stderr.flush()
+        return body
     except Exception as e:
         sys.stderr.write("tg %s error: %s\n" % (method, e)); sys.stderr.flush()
         return None
@@ -92,7 +102,7 @@ def retry_pending(st):
         return
     left = []
     for a in pend[:20]:
-        if send(a["cid"], "(повтор) " + a["text"]):
+        if send(a["cid"], "(повтор) " + a["text"], kb=True):
             sys.stderr.write("queued alert delivered to %s\n" % a["cid"])
         else:
             left.append(a)
@@ -334,15 +344,17 @@ def handle(msg):
 
 def handle_callback(cb):
     # нажатие инлайн-кнопки: гасим "часики" и выполняем как команду
-    cid = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+    # message может отсутствовать (недоступное сообщение) — fallback на id нажавшего
+    cid = str((cb.get("message") or {}).get("chat", {}).get("id", "")
+              or cb.get("from", {}).get("id", ""))
     t0 = time.time()
-    r = tg("answerCallbackQuery", {"callback_query_id": cb.get("id", "")}, timeout=10)
-    ok = bool(r and r.get("ok"))
+    r = tg("answerCallbackQuery", {"callback_query_id": cb.get("id", "")}, timeout=15)
     sys.stderr.write("callback data=%s answer_ok=%s answer_took=%.1fs\n"
-                     % (cb.get("data"), ok, time.time() - t0))
-    if not ok:
-        # колбэк протух (Telegram принимает ответ ~15-30с после нажатия):
-        # юзер жал давно/серией — не шлём запоздалый ответ, чтобы не спамить чат
+                     % (cb.get("data"), (r or {}).get("ok"), time.time() - t0))
+    if r is not None and not r.get("ok") and r.get("error_code") == 400:
+        # колбэк ПРОТУХ (Telegram принимает ответ ~15-30с после нажатия):
+        # не шлём запоздалый ответ, чтобы не спамить чат. Сетевой сбой (r is None)
+        # протуханием НЕ считаем — отвечаем как обычно, лучше поздно, чем никогда.
         return
     if cid not in ALLOWED:
         send(cid, "⛔ Не авторизован. Твой chat_id: %s" % cid)
@@ -363,7 +375,11 @@ def main():
     last_check = time.time()
     while True:
         tp = time.time()
-        upd = tg("getUpdates", {"offset": offset, "timeout": 20}, timeout=35)
+        # allowed_updates явно: настройка ПЕРСИСТЕНТНА на стороне Telegram —
+        # без callback_query в списке нажатия кнопок молча не доставляются
+        upd = tg("getUpdates", {"offset": offset, "timeout": 20,
+                                "allowed_updates": '["message","edited_message","callback_query"]'},
+                 timeout=35)
         n = len(upd["result"]) if (upd and upd.get("ok")) else -1
         if n != 0:
             sys.stderr.write("poll took=%.1fs updates=%d\n" % (time.time() - tp, n))
@@ -382,6 +398,8 @@ def main():
                     except Exception as e:
                         sys.stderr.write("callback error: %s\n" % e)
             save_state(st)
+        elif upd is not None:
+            time.sleep(2)  # HTTP-ошибка API (401/409/429): не долбим в busy-loop
         if time.time() - last_check >= CHECK_INTERVAL:
             try: monitor(st)
             except Exception as e:
