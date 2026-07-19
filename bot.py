@@ -39,6 +39,8 @@ ALLOWED = set(x.strip() for x in CFG.get("ALLOWED_CHAT_IDS", "").split(",") if x
 CHECK_INTERVAL   = int(CFG.get("CHECK_INTERVAL", "60"))
 DISK_WARN_PCT    = int(CFG.get("DISK_WARN_PCT", "85"))
 SYNC_LAG_WARN    = int(CFG.get("SYNC_LAG_WARN_SEC", "30"))
+STALL_TICKS      = int(CFG.get("STALL_TICKS", "5"))       # тиков без роста блока до алерта (5*60с=5мин)
+REALERT_SEC      = int(CFG.get("REALERT_SEC", "1800"))    # повтор алерта критического состояния, сек
 API = "https://api.telegram.org/bot%s/" % TOKEN
 SSLCTX = ssl.create_default_context()
 
@@ -54,14 +56,36 @@ def tg(method, params=None, timeout=35):
         return None
 
 def send(chat_id, text):
-    # plain text, split if very long
+    # plain text, split if very long; True если все части доставлены
+    ok = True
     for i in range(0, len(text), 3900):
-        tg("sendMessage", {"chat_id": chat_id, "text": text[i:i+3900],
-                           "disable_web_page_preview": "true"})
+        r = tg("sendMessage", {"chat_id": chat_id, "text": text[i:i+3900],
+                               "disable_web_page_preview": "true"})
+        if not (r and r.get("ok")):
+            ok = False
+    return ok
 
-def broadcast(text):
+def broadcast(text, st=None):
+    """Шлёт алерт всем; недоставленное кладёт в очередь st для ретрая."""
     for cid in ALLOWED:
-        send(cid, text)
+        if send(cid, text):
+            sys.stderr.write("alert delivered to %s: %s\n" % (cid, text.splitlines()[0][:60]))
+        elif st is not None:
+            st.setdefault("pending_alerts", []).append({"cid": cid, "text": text})
+            sys.stderr.write("alert QUEUED (send failed) for %s\n" % cid)
+
+def retry_pending(st):
+    """Ретрай недоставленных алертов (переживают сетевые дыры к Telegram)."""
+    pend = st.get("pending_alerts") or []
+    if not pend:
+        return
+    left = []
+    for a in pend[:20]:
+        if send(a["cid"], "(повтор) " + a["text"]):
+            sys.stderr.write("queued alert delivered to %s\n" % a["cid"])
+        else:
+            left.append(a)
+    st["pending_alerts"] = left + pend[20:]
 
 # ---------- shell helpers ----------
 def sh(cmd, timeout=10):
@@ -218,6 +242,36 @@ def monitor(st):
     elif not behind and st.get("behind") and not rpc_dead:
         alerts.append("✅ Синк восстановлен (lag %ss)" % (s["lag"]))
     st["behind"] = behind
+    # БЛОК НЕ РАСТЁТ (урок инцидента 2026-07-19: 5ч фриза с одним тихим алертом)
+    h = s["height"]
+    if h is not None:
+        if st.get("last_height") == h:
+            st["stall_ticks"] = st.get("stall_ticks", 0) + 1
+        else:
+            if st.get("stalled"):
+                alerts.append("✅ Блоки снова растут: %s" % h)
+            st["stall_ticks"] = 0
+            st["stalled"] = False
+        if st.get("stall_ticks", 0) >= STALL_TICKS and not st.get("stalled"):
+            alerts.append("🔴 БЛОКИ НЕ РАСТУТ: высота застряла на %s (~%d мин). Consensus стоит!"
+                          % (h, st["stall_ticks"] * CHECK_INTERVAL // 60))
+            st["stalled"] = True
+        st["last_height"] = h
+    # РЕ-АЛЕРТ критических состояний каждые REALERT_SEC (не молчать часами!)
+    now = time.time()
+    crit = []
+    if st.get("stalled"):  crit.append("🔴 ВСЁ ЕЩЁ СТОИТ: блок %s не растёт" % st.get("last_height"))
+    if st.get("rpc_dead"): crit.append("🔴 RPC всё ещё не отвечает")
+    for svc in SERVICES:
+        if st.get("active_" + svc) is False:
+            crit.append("🔴 %s всё ещё down" % svc)
+    if crit:
+        if now - st.get("last_realert", 0) >= REALERT_SEC:
+            alerts.append("⏰ НАПОМИНАНИЕ (повтор каждые %d мин):\n" % (REALERT_SEC // 60)
+                          + "\n".join(crit))
+            st["last_realert"] = now
+    else:
+        st["last_realert"] = 0
     # disk
     d = get_disk()
     if d["pct"] is not None:
@@ -236,7 +290,8 @@ def monitor(st):
     st["wd_count"] = cnt
 
     if alerts:
-        broadcast("\n\n".join(alerts))
+        broadcast("\n\n".join(alerts), st)
+    retry_pending(st)
     save_state(st)
 
 # ---------- command handling ----------
@@ -270,7 +325,7 @@ def main():
     offset = st.get("offset", 0)
     # init service baselines so first tick doesn't false-alarm
     monitor(st)
-    broadcast("🟢 monad-tg-bot запущен на %s. /help — команды." % HOST)
+    broadcast("🤖 monad-tg-bot запущен на %s. /help — команды." % HOST)
     last_check = time.time()
     while True:
         upd = tg("getUpdates", {"offset": offset, "timeout": 20}, timeout=35)

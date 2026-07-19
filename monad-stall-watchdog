@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# monad-stall-watchdog — авто-рестарт monad-bft при зависании консенсуса.
+# Урок инцидента 2026-07-19: после транзиентной сетевой деградации нода
+# зависла в local-timeout на 5 часов и не восстановилась сама; ручной
+# systemctl restart monad-bft вернул её к жизни. Этот watchdog делает то же
+# автоматически.
+#
+# Логика: eth_blockNumber не меняется >= STALL_MIN минут при активном
+# monad-bft -> restart. Грейсы: сервис моложе GRACE_MIN мин (statesync после
+# старта) не трогаем; между рестартами COOLDOWN_MIN мин; пустой ответ RPC
+# stall'ом НЕ считается (во время statesync RPC легально молчит).
+# Cron: */5 * * * * /usr/local/bin/monad-stall-watchdog >> /var/log/monad-stall-watchdog.log 2>&1
+
+set -u
+RPC=http://localhost:8080
+STATE=/var/lib/monad-stall-watchdog.state
+STALL_MIN=${STALL_MIN:-15}
+GRACE_MIN=${GRACE_MIN:-20}
+COOLDOWN_MIN=${COOLDOWN_MIN:-60}
+NOW=$(date +%s)
+TS() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+[ "$(systemctl is-active monad-bft 2>/dev/null)" = "active" ] || { echo "$(TS) SKIP — monad-bft не active"; exit 0; }
+
+# грейс после старта сервиса (statesync-окно)
+START=$(systemctl show monad-bft -p ExecMainStartTimestamp --value 2>/dev/null)
+START_EPOCH=$(date -d "$START" +%s 2>/dev/null || echo 0)
+if [ $((NOW - START_EPOCH)) -lt $((GRACE_MIN * 60)) ]; then
+  echo "$(TS) SKIP — сервис моложе ${GRACE_MIN} мин (statesync-грейс)"; exit 0
+fi
+
+HEX=$(curl -s --max-time 8 -X POST $RPC -H 'Content-Type: application/json' \
+  --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' 2>/dev/null \
+  | grep -oE '"result":"0x[0-9a-f]+"' | grep -oE '0x[0-9a-f]+')
+if [ -z "$HEX" ]; then
+  echo "$(TS) NO-DATA — RPC пуст (statesync?), stall не считаем"; exit 0
+fi
+H=$((HEX))
+
+read -r PREV_H PREV_T LAST_RESTART < "$STATE" 2>/dev/null || { PREV_H=0; PREV_T=$NOW; LAST_RESTART=0; }
+
+if [ "$H" -ne "$PREV_H" ]; then
+  echo "$H $NOW $LAST_RESTART" > "$STATE"
+  echo "$(TS) OK — блок $H растёт"
+  exit 0
+fi
+
+STUCK_SEC=$((NOW - PREV_T))
+if [ "$STUCK_SEC" -lt $((STALL_MIN * 60)) ]; then
+  echo "$(TS) WATCH — блок $H не растёт $((STUCK_SEC / 60)) мин (порог ${STALL_MIN})"
+  exit 0
+fi
+
+if [ $((NOW - LAST_RESTART)) -lt $((COOLDOWN_MIN * 60)) ]; then
+  echo "$(TS) ALERT — stall $((STUCK_SEC / 60)) мин, но cooldown ${COOLDOWN_MIN} мин не истёк. НУЖНО ВМЕШАТЕЛЬСТВО ВРУЧНУЮ."
+  exit 0
+fi
+
+echo "$(TS) ACTION — блок $H не растёт $((STUCK_SEC / 60)) мин: restarting monad-bft"
+systemctl restart monad-bft
+echo "$H $NOW $NOW" > "$STATE"
+echo "$(TS) restarted monad-bft (stall-watchdog)"
