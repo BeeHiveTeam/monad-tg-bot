@@ -335,11 +335,21 @@ def handle(msg):
 def handle_callback(cb):
     # нажатие инлайн-кнопки: гасим "часики" и выполняем как команду
     cid = str(cb.get("message", {}).get("chat", {}).get("id", ""))
-    tg("answerCallbackQuery", {"callback_query_id": cb.get("id", "")}, timeout=10)
+    t0 = time.time()
+    r = tg("answerCallbackQuery", {"callback_query_id": cb.get("id", "")}, timeout=10)
+    ok = bool(r and r.get("ok"))
+    sys.stderr.write("callback data=%s answer_ok=%s answer_took=%.1fs\n"
+                     % (cb.get("data"), ok, time.time() - t0))
+    if not ok:
+        # колбэк протух (Telegram принимает ответ ~15-30с после нажатия):
+        # юзер жал давно/серией — не шлём запоздалый ответ, чтобы не спамить чат
+        return
     if cid not in ALLOWED:
         send(cid, "⛔ Не авторизован. Твой chat_id: %s" % cid)
         return
+    t1 = time.time()
     dispatch(cid, (cb.get("data") or "").strip().lower())
+    sys.stderr.write("dispatch %s took=%.1fs\n" % (cb.get("data"), time.time() - t1))
 
 # ---------- main loop ----------
 def main():
@@ -352,7 +362,11 @@ def main():
     broadcast("🤖 monad-tg-bot запущен на %s. /help — команды." % HOST)
     last_check = time.time()
     while True:
+        tp = time.time()
         upd = tg("getUpdates", {"offset": offset, "timeout": 20}, timeout=35)
+        n = len(upd["result"]) if (upd and upd.get("ok")) else -1
+        if n != 0:
+            sys.stderr.write("poll took=%.1fs updates=%d\n" % (time.time() - tp, n))
         if upd and upd.get("ok"):
             for u in upd["result"]:
                 offset = u["update_id"] + 1
