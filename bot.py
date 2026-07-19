@@ -55,12 +55,23 @@ def tg(method, params=None, timeout=35):
         sys.stderr.write("tg %s error: %s\n" % (method, e)); sys.stderr.flush()
         return None
 
-def send(chat_id, text):
+KEYBOARD = json.dumps({"inline_keyboard": [
+    [{"text": "📟 Статус", "callback_data": "status"}, {"text": "🔄 Синк", "callback_data": "sync"}],
+    [{"text": "💾 Диск", "callback_data": "disk"}, {"text": "🐕 Waltrace", "callback_data": "waltrace"}],
+    [{"text": "🖥 Нода", "callback_data": "node"}, {"text": "❓ Помощь", "callback_data": "help"}],
+]})
+
+def send(chat_id, text, kb=False):
     # plain text, split if very long; True если все части доставлены
+    # kb=True — прикрепить инлайн-кнопки к последней части
     ok = True
-    for i in range(0, len(text), 3900):
-        r = tg("sendMessage", {"chat_id": chat_id, "text": text[i:i+3900],
-                               "disable_web_page_preview": "true"})
+    chunks = [text[i:i+3900] for i in range(0, len(text), 3900)]
+    for n, chunk in enumerate(chunks):
+        params = {"chat_id": chat_id, "text": chunk,
+                  "disable_web_page_preview": "true"}
+        if kb and n == len(chunks) - 1:
+            params["reply_markup"] = KEYBOARD
+        r = tg("sendMessage", params)
         if not (r and r.get("ok")):
             ok = False
     return ok
@@ -68,7 +79,7 @@ def send(chat_id, text):
 def broadcast(text, st=None):
     """Шлёт алерт всем; недоставленное кладёт в очередь st для ретрая."""
     for cid in ALLOWED:
-        if send(cid, text):
+        if send(cid, text, kb=True):
             sys.stderr.write("alert delivered to %s: %s\n" % (cid, text.splitlines()[0][:60]))
         elif st is not None:
             st.setdefault("pending_alerts", []).append({"cid": cid, "text": text})
@@ -295,6 +306,16 @@ def monitor(st):
     save_state(st)
 
 # ---------- command handling ----------
+def dispatch(cid, cmd):
+    # общий диспетчер для /команд и нажатий кнопок
+    if cmd == "status":   send(cid, fmt_status(), kb=True)
+    elif cmd == "sync":   send(cid, fmt_sync(), kb=True)
+    elif cmd == "disk":   send(cid, fmt_disk(), kb=True)
+    elif cmd == "waltrace": send(cid, fmt_waltrace(), kb=True)
+    elif cmd == "node":   send(cid, fmt_node(), kb=True)
+    elif cmd == "help":   send(cid, HELP, kb=True)
+    else: send(cid, "Неизвестная команда. /help", kb=True)
+
 def handle(msg):
     chat = msg.get("chat", {})
     cid = str(chat.get("id", ""))
@@ -304,18 +325,21 @@ def handle(msg):
     cmd = text.split()[0].lstrip("/").split("@")[0].lower()
     if cmd in ("id", "start"):
         send(cid, "chat_id: %s\nДобавь его в ALLOWED_CHAT_IDS в config.env и перезапусти сервис.\n\n%s"
-                  % (cid, HELP if cid in ALLOWED else ""))
+                  % (cid, HELP if cid in ALLOWED else ""), kb=cid in ALLOWED)
         return
     if cid not in ALLOWED:
         send(cid, "⛔ Не авторизован. Твой chat_id: %s" % cid)
         return
-    if cmd == "status":   send(cid, fmt_status())
-    elif cmd == "sync":   send(cid, fmt_sync())
-    elif cmd == "disk":   send(cid, fmt_disk())
-    elif cmd == "waltrace": send(cid, fmt_waltrace())
-    elif cmd == "node":   send(cid, fmt_node())
-    elif cmd == "help":   send(cid, HELP)
-    else: send(cid, "Неизвестная команда. /help")
+    dispatch(cid, cmd)
+
+def handle_callback(cb):
+    # нажатие инлайн-кнопки: гасим "часики" и выполняем как команду
+    cid = str(cb.get("message", {}).get("chat", {}).get("id", ""))
+    tg("answerCallbackQuery", {"callback_query_id": cb.get("id", "")}, timeout=10)
+    if cid not in ALLOWED:
+        send(cid, "⛔ Не авторизован. Твой chat_id: %s" % cid)
+        return
+    dispatch(cid, (cb.get("data") or "").strip().lower())
 
 # ---------- main loop ----------
 def main():
@@ -338,6 +362,11 @@ def main():
                     try: handle(m)
                     except Exception as e:
                         sys.stderr.write("handle error: %s\n" % e)
+                cb = u.get("callback_query")
+                if cb:
+                    try: handle_callback(cb)
+                    except Exception as e:
+                        sys.stderr.write("callback error: %s\n" % e)
             save_state(st)
         if time.time() - last_check >= CHECK_INTERVAL:
             try: monitor(st)
