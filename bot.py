@@ -9,11 +9,13 @@ Pure stdlib (urllib, json, subprocess). Single-threaded loop:
 Config: /opt/monad-tg-bot/config.env   State: /opt/monad-tg-bot/state.json
 Runs as root (needs systemctl/journalctl/df and the root-owned watchdog log).
 """
-import json, os, re, ssl, subprocess, sys, time, urllib.parse, urllib.request
+import calendar, json, os, re, ssl, subprocess, sys, time, urllib.parse, urllib.request
 
 CFG_PATH   = "/opt/monad-tg-bot/config.env"
 STATE_PATH = "/opt/monad-tg-bot/state.json"
 WATCHDOG_LOG = "/var/log/monad-waltrace-watchdog.log"
+# Действие watchdog связываем с рестартом ноды только если оно не старше этого.
+WATCHDOG_FRESH_SEC = 900
 RPC = "http://localhost:8080"
 SERVICES = ["monad-bft", "monad-execution", "monad-rpc"]
 HOST = os.uname().nodename
@@ -152,8 +154,36 @@ def get_disk():
     return {"pct": None, "avail_gb": None}
 
 def last_watchdog_action():
+    """Последняя строка действия watchdog (для показа в /waltrace), без учёта времени."""
     out = sh("grep -E 'ACTION|restarted' %s 2>/dev/null | tail -1" % WATCHDOG_LOG)
     return out
+
+def watchdog_action_age():
+    """Возраст последнего действия watchdog в секундах, либо None если не разобрать."""
+    out = last_watchdog_action()
+    if not out:
+        return None
+    m = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z", out)
+    if not m:
+        return None
+    try:
+        return time.time() - calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return None
+
+def recent_watchdog_action(max_age=WATCHDOG_FRESH_SEC):
+    """То же, но пусто если действие СТАРОЕ.
+
+    Атрибуция рестарта раньше смотрела на последнюю строку лога без проверки
+    времени. Когда waltrace-watchdog отключили, в логе навсегда осталась старая
+    строка 'restarted monad-bft', и ЛЮБОЙ последующий рестарт ноды помечался
+    '(watchdog/waltrace — ожидаемо)' — то есть настоящая нештатная перезагрузка
+    выглядела безобидной.
+    """
+    age = watchdog_action_age()
+    if age is None or age > max_age:
+        return ""
+    return last_watchdog_action()
 
 def watchdog_restart_count():
     return sh("grep -c 'ACTION: restarting' %s 2>/dev/null" % WATCHDOG_LOG) or "0"
@@ -200,6 +230,11 @@ def fmt_disk():
 def fmt_waltrace():
     cnt = watchdog_restart_count()
     last = last_watchdog_action() or "нет записей"
+    age = watchdog_action_age()
+    # Без отметки возраста замороженный лог (watchdog снят с cron после того,
+    # как баг waltrace починили апстримом в monad 0.15.2) читается как свежий.
+    if age is not None and age > WATCHDOG_FRESH_SEC:
+        last += "\n⚠️ запись старая (%d ч назад) — watchdog, вероятно, отключён" % int(age // 3600)
     flood = sh("journalctl -u monad-bft --since '5 min ago' --no-pager 2>/dev/null | grep -c 'waltrace thread stopped'")
     return ("Waltrace watchdog\nВсего авто-рестартов: %s\nФлуд за 5 мин: %s\nПоследнее действие:\n%s"
             % (cnt, flood, last))
@@ -244,7 +279,7 @@ def monitor(st):
         elif prev_active is False and active:
             alerts.append("✅ Сервис восстановлен: %s снова active" % s)
         if prev_start and start and start != prev_start and active:
-            wd = last_watchdog_action()
+            wd = recent_watchdog_action()
             tag = " (watchdog/waltrace — ожидаемо)" if (s == "monad-bft" and wd and "restart" in wd.lower()) else ""
             alerts.append("🔄 РЕСТАРТ: %s перезапущен%s\nстарт: %s" % (s, tag, start))
         st["active_" + s] = active
