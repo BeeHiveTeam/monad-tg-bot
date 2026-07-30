@@ -13,7 +13,15 @@ import calendar, json, os, re, ssl, subprocess, sys, time, urllib.parse, urllib.
 
 CFG_PATH   = "/opt/monad-tg-bot/config.env"
 STATE_PATH = "/opt/monad-tg-bot/state.json"
-WATCHDOG_LOG = "/var/log/monad-waltrace-watchdog.log"
+# Логи watchdog-ов. Исторически бот знал только про waltrace-watchdog, но баг waltrace
+# починен апстримом в monad 0.15.2, и этот watchdog снят с cron — его лог заморожен навсегда.
+# Живой сейчас monad-stall-watchdog (зависание консенсуса, урок инцидента 2026-07-19), и его
+# бот не видел вовсе. Смотрим оба: waltrace оставлен на случай возврата, ведущий — stall.
+WATCHDOG_LOGS = [
+    "/var/log/monad-stall-watchdog.log",
+    "/var/log/monad-waltrace-watchdog.log",
+]
+WATCHDOG_LOG = WATCHDOG_LOGS[1]   # обратная совместимость для /waltrace
 # Действие watchdog связываем с рестартом ноды только если оно не старше этого.
 WATCHDOG_FRESH_SEC = 900
 RPC = "http://localhost:8080"
@@ -43,6 +51,8 @@ DISK_WARN_PCT    = int(CFG.get("DISK_WARN_PCT", "85"))
 SYNC_LAG_WARN    = int(CFG.get("SYNC_LAG_WARN_SEC", "30"))
 STALL_TICKS      = int(CFG.get("STALL_TICKS", "5"))       # тиков без роста блока до алерта (5*60с=5мин)
 REALERT_SEC      = int(CFG.get("REALERT_SEC", "1800"))    # повтор алерта критического состояния, сек
+PENDING_MAX     = int(CFG.get("PENDING_MAX", "50"))      # максимум недоставленных алертов
+PENDING_TTL_SEC = int(CFG.get("PENDING_TTL_SEC", "21600"))  # 6ч: позже алерт неактуален
 API = "https://api.telegram.org/bot%s/" % TOKEN
 SSLCTX = ssl.create_default_context()
 
@@ -94,7 +104,7 @@ def broadcast(text, st=None):
         if send(cid, text, kb=True):
             sys.stderr.write("alert delivered to %s: %s\n" % (cid, text.splitlines()[0][:60]))
         elif st is not None:
-            st.setdefault("pending_alerts", []).append({"cid": cid, "text": text})
+            st.setdefault("pending_alerts", []).append({"cid": cid, "text": text, "ts": time.time()})
             sys.stderr.write("alert QUEUED (send failed) for %s\n" % cid)
 
 def retry_pending(st):
@@ -108,15 +118,48 @@ def retry_pending(st):
             sys.stderr.write("queued alert delivered to %s\n" % a["cid"])
         else:
             left.append(a)
-    st["pending_alerts"] = left + pend[20:]
+    # Cap + TTL: очередь не ограничивалась и не истекала. При долгой недоступности
+    # Telegram она росла без предела, а retry_pending() внутри monitor() пытался до 20
+    # отправок по 35с — до ~12 минут блокировки тика: не идёт long-poll (команды не
+    # отвечают) и не выполняются проверки. Старые алерты приезжали через часы без
+    # отметки времени и читались как свежая авария.
+    keep = (left + pend[20:])[-PENDING_MAX:]
+    now = time.time()
+    st["pending_alerts"] = [a for a in keep
+                            if now - float(a.get("ts") or now) <= PENDING_TTL_SEC]
 
 # ---------- shell helpers ----------
 def sh(cmd, timeout=10):
+    """Вывод команды; "" и при ошибке, и при пустом выводе.
+
+    Оставлено для мест, где различать эти два случая не нужно. Там, где нужно
+    (состояние сервисов, диск, счётчики), используй sh_try().
+    """
     try:
         return subprocess.run(cmd, shell=True, capture_output=True, text=True,
                               timeout=timeout).stdout.strip()
     except Exception:
         return ""
+
+def sh_try(cmd, timeout=10):
+    """(получилось, вывод). Отличает «команда не выполнилась» от «пустой вывод».
+
+    Раньше всё шло через sh(), и таймаут systemd-dbus давал "" → svc_active()=False →
+    ложный «🔴 СЕРВИС УПАЛ», а svc_start()="" ломал детект рестарта: пустое prev_start
+    falsy, поэтому РЕАЛЬНЫЙ рестарт, совпавший с одной осечкой systemctl, не репортился
+    вообще. Подвисший df (а он подвисает как раз при проблемах с IO) молча отключал
+    проверку диска.
+    Процессы убиваем группой: при shell=True с пайпами SIGKILL получал только sh,
+    а journalctl/grep оставались осиротевшими и жгли IO рядом с нодой.
+    """
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                           timeout=timeout, start_new_session=True)
+        return (p.returncode == 0), p.stdout.strip()
+    except subprocess.TimeoutExpired:
+        return False, ""
+    except Exception:
+        return False, ""
 
 def rpc(method, params=None):
     body = json.dumps({"jsonrpc": "2.0", "method": method,
@@ -130,8 +173,35 @@ def rpc(method, params=None):
         return None
 
 # ---------- checks ----------
-def svc_active(s):   return sh("systemctl is-active %s" % s) == "active"
-def svc_start(s):    return sh("systemctl show %s -p ExecMainStartTimestamp --value" % s)
+def svc_state(s):
+    """(известно, active, sub) одним вызовом systemctl show.
+
+    `activating` (и `auto-restart`) — это НЕ падение: на каждом штатном рестарте тик,
+    попавший в фазу запуска, выдавал пару ложных алертов «СЕРВИС УПАЛ» → «восстановлен».
+    Ночной пейдж на плановой операции быстро обесценивает сам алерт.
+    """
+    ok, out = sh_try("systemctl show %s -p ActiveState -p SubState --value" % s)
+    if not ok or not out:
+        return False, None, None
+    lines = [l.strip() for l in out.splitlines() if l.strip()]
+    active = lines[0] if lines else ""
+    sub = lines[1] if len(lines) > 1 else ""
+    return True, active, sub
+
+def svc_active(s):
+    """True / False / None (не смогли узнать — состояние НЕ трогаем в monitor)."""
+    known, active, sub = svc_state(s)
+    if not known:
+        return None
+    if active == "active":
+        return True
+    if active in ("activating", "deactivating", "reloading") or sub == "auto-restart":
+        return None          # переходная фаза — не считаем падением
+    return False
+
+def svc_start(s):
+    ok, out = sh_try("systemctl show %s -p ExecMainStartTimestamp --value" % s)
+    return out if ok else None
 
 def get_sync():
     syncing = rpc("eth_syncing")
@@ -145,31 +215,122 @@ def get_sync():
     return {"syncing": syncing, "height": height, "lag": lag}
 
 def get_disk():
-    out = sh("df -P / | tail -1")  # md3
+    # df подвисает именно при проблемах с IO, поэтому «не выполнилось» и «пусто» надо
+    # различать: раньше оба давали pct=None и проверка диска молча выключалась.
+    ok, out = sh_try("df -P / | tail -1")  # md3
+    if not ok:
+        return {"pct": None, "avail_gb": None, "known": False}
     parts = out.split()
     if len(parts) >= 5:
-        pct = int(parts[4].rstrip("%"))
-        avail_gb = int(parts[3]) / 1024 / 1024
-        return {"pct": pct, "avail_gb": round(avail_gb, 1)}
-    return {"pct": None, "avail_gb": None}
+        try:
+            pct = int(parts[4].rstrip("%"))
+            avail_gb = int(parts[3]) / 1024 / 1024
+            return {"pct": pct, "avail_gb": round(avail_gb, 1), "known": True}
+        except ValueError:
+            pass
+    return {"pct": None, "avail_gb": None, "known": False}
 
-def last_watchdog_action():
-    """Последняя строка действия watchdog (для показа в /waltrace), без учёта времени."""
-    out = sh("grep -E 'ACTION|restarted' %s 2>/dev/null | tail -1" % WATCHDOG_LOG)
+# ---------- мост Prometheus → Telegram ----------
+# Правила в prometheus/alerts.yml исправно «фаерились», но получателя не было вовсе:
+# ни alertmanager в стеке, ни провижининга нотификаций Grafana — /api/v1/alertmanagers
+# отдавал active=0. Проще всего переиспользовать этот бот: доставка, повторы, очередь и
+# список разрешённых чатов у него уже есть.
+PROM_URL = os.environ.get("PROM_URL", "http://127.0.0.1:9090")
+# Эти алерты бот проверяет сам, напрямую — пересылать их значило бы дублировать сообщения.
+PROM_SKIP_ALERTS = {
+    "MonadServiceDown", "MonadLocalRpcDown",
+    "NodeDiskAlmostFull", "NodeDiskFillingUp",
+}
+
+def prometheus_alerts():
+    """[(имя, severity, summary)] по фаерящимся алертам, либо None если Prometheus недоступен."""
+    try:
+        with urllib.request.urlopen(PROM_URL + "/api/v1/alerts", timeout=6) as r:
+            d = json.load(r)
+    except Exception:
+        return None
+    if d.get("status") != "success":
+        return None
+    out = []
+    for a in d.get("data", {}).get("alerts", []):
+        if a.get("state") != "firing":
+            continue
+        name = (a.get("labels") or {}).get("alertname", "?")
+        if name in PROM_SKIP_ALERTS:
+            continue
+        sev = (a.get("labels") or {}).get("severity", "")
+        summ = (a.get("annotations") or {}).get("summary", "")
+        lbl = (a.get("labels") or {}).get("service") or (a.get("labels") or {}).get("mountpoint") or ""
+        key = name + (":" + lbl if lbl else "")
+        out.append((key, sev, summ))
     return out
 
-def watchdog_action_age():
-    """Возраст последнего действия watchdog в секундах, либо None если не разобрать."""
-    out = last_watchdog_action()
-    if not out:
-        return None
-    m = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z", out)
+def last_watchdog_action(logs=None):
+    """Самая свежая строка действия среди ВСЕХ логов watchdog, без учёта времени.
+
+    Паттерн намеренно без привязки к пунктуации: stall-watchdog пишет
+    'ACTION — блок N не растёт M мин: restarting monad-bft', а прежний греп искал
+    'ACTION: restarting' и не совпадал бы даже при верном пути к логу.
+    """
+    best, best_ts = "", -1
+    for p in (logs or WATCHDOG_LOGS):
+        out = sh("grep -E 'ACTION|ALERT|restarted' %s 2>/dev/null | tail -1" % p)
+        if not out:
+            continue
+        ts = _line_epoch(out)
+        if ts is None:          # без метки времени — берём, только если ничего лучше нет
+            if best_ts < 0 and not best:
+                best = out
+            continue
+        if ts > best_ts:
+            best, best_ts = out, ts
+    return best
+
+def _line_epoch(line):
+    """Epoch из ведущей метки 2026-07-29T22:55:01Z, либо None."""
+    m = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})Z", line or "")
     if not m:
         return None
     try:
-        return time.time() - calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S"))
+        return calendar.timegm(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S"))
     except ValueError:
         return None
+
+def watchdog_needs_attention():
+    """Строка ALERT от watchdog'а, если она свежая.
+
+    Самое тяжёлое сообщение stall-watchdog — 'ALERT — stall N мин, но cooldown не истёк.
+    НУЖНО ВМЕШАТЕЛЬСТВО ВРУЧНУЮ' — означает, что нода зависла ПОВТОРНО после авто-рестарта
+    и автоматика сдалась. В Telegram оно не уходило никак: ложилось в лог, который никто
+    не читает. Теперь это отдельный алерт.
+    """
+    for p in WATCHDOG_LOGS:
+        out = sh("grep -E 'ALERT' %s 2>/dev/null | tail -1" % p)
+        if not out:
+            continue
+        ts = _line_epoch(out)
+        if ts is not None and time.time() - ts <= WATCHDOG_FRESH_SEC:
+            return out
+    return ""
+
+def watchdog_alive():
+    """(есть_живой_watchdog, возраст_последней_записи). Мёртвый watchdog сам по себе — авария:
+    раньше его остановка была невидима, нода осталась бы без авто-восстановления молча."""
+    freshest = None
+    for p in WATCHDOG_LOGS:
+        out = sh("stat -c %%Y %s 2>/dev/null" % p)
+        if out.isdigit():
+            age = time.time() - int(out)
+            if freshest is None or age < freshest:
+                freshest = age
+    if freshest is None:
+        return False, None
+    return freshest <= 1800, freshest
+
+def watchdog_action_age():
+    """Возраст последнего действия watchdog в секундах, либо None если не разобрать."""
+    ts = _line_epoch(last_watchdog_action())
+    return None if ts is None else time.time() - ts
 
 def recent_watchdog_action(max_age=WATCHDOG_FRESH_SEC):
     """То же, но пусто если действие СТАРОЕ.
@@ -186,7 +347,19 @@ def recent_watchdog_action(max_age=WATCHDOG_FRESH_SEC):
     return last_watchdog_action()
 
 def watchdog_restart_count():
-    return sh("grep -c 'ACTION: restarting' %s 2>/dev/null" % WATCHDOG_LOG) or "0"
+    """Сумма авто-рестартов по всем логам watchdog.
+
+    Считаем по 'restarting' без привязки к пунктуации — прежний 'ACTION: restarting' не
+    совпадал с форматом stall-watchdog. И возвращаем None при недоступности лога, а не "0":
+    ноль здесь читался как «рестартов не было» и на следующем удачном тике давал ложный
+    алерт «watchdog сделал авто-рестарт (всего: 33)» на полностью спокойной ноде.
+    """
+    total, seen = 0, False
+    for p in WATCHDOG_LOGS:
+        out = sh("grep -cE 'restarting|restarted' %s 2>/dev/null" % p)
+        if out.isdigit():
+            total += int(out); seen = True
+    return total if seen else None
 
 def node_version():
     v = sh("monad-node --version 2>/dev/null")
@@ -196,8 +369,15 @@ def node_version():
 # ---------- formatted reports (for commands) ----------
 def fmt_status():
     L = ["📟 Monad node — %s" % HOST]
-    bad = [s for s in SERVICES if not svc_active(s)]
-    L.append("Сервисы: " + ("✅ все active" if not bad else "🔴 down: " + ", ".join(bad)))
+    _st = {s: svc_active(s) for s in SERVICES}
+    bad = [s for s, v in _st.items() if v is False]
+    unk = [s for s, v in _st.items() if v is None]
+    if bad:
+        L.append("Сервисы: 🔴 down: " + ", ".join(bad))
+    elif unk:
+        L.append("Сервисы: ❔ не удалось опросить: " + ", ".join(unk))
+    else:
+        L.append("Сервисы: ✅ все active")
     s = get_sync()
     if s["height"] is not None:
         sync_txt = "✅ у типа" if s["syncing"] in (False, None) else "🟡 syncing"
@@ -210,7 +390,8 @@ def fmt_status():
         icon = "✅" if d["pct"] < DISK_WARN_PCT else "🟡"
         L.append("Диск /: %s %d%% занято, %s ГБ свободно" % (icon, d["pct"], d["avail_gb"]))
     L.append("Версия: %s" % node_version())
-    L.append("Waltrace-рестартов всего: %s" % watchdog_restart_count())
+    _wc = watchdog_restart_count()
+    L.append("Авто-рестартов watchdog всего: %s" % ("н/д" if _wc is None else _wc))
     return "\n".join(L)
 
 def fmt_sync():
@@ -231,13 +412,29 @@ def fmt_waltrace():
     cnt = watchdog_restart_count()
     last = last_watchdog_action() or "нет записей"
     age = watchdog_action_age()
-    # Без отметки возраста замороженный лог (watchdog снят с cron после того,
-    # как баг waltrace починили апстримом в monad 0.15.2) читается как свежий.
     if age is not None and age > WATCHDOG_FRESH_SEC:
-        last += "\n⚠️ запись старая (%d ч назад) — watchdog, вероятно, отключён" % int(age // 3600)
-    flood = sh("journalctl -u monad-bft --since '5 min ago' --no-pager 2>/dev/null | grep -c 'waltrace thread stopped'")
-    return ("Waltrace watchdog\nВсего авто-рестартов: %s\nФлуд за 5 мин: %s\nПоследнее действие:\n%s"
-            % (cnt, flood, last))
+        last += "\n⚠️ запись старая (%s назад)" % (
+            "%d ч" % int(age // 3600) if age >= 3600 else "%d мин" % int(age // 60))
+    L = ["Watchdog-и ноды"]
+    for p in WATCHDOG_LOGS:
+        mt = sh("stat -c %%Y %s 2>/dev/null" % p)
+        name = os.path.basename(p).replace(".log", "")
+        if not mt.isdigit():
+            L.append("  %s: лога нет" % name)
+        else:
+            a = int(time.time() - int(mt))
+            state = "живой" if a <= 1800 else "МОЛЧИТ"
+            L.append("  %s: %s, запись %d мин назад" % (name, state, a // 60))
+    L.append("Всего авто-рестартов: %s" % ("н/д" if cnt is None else cnt))
+    # Флуд waltrace оставлен как диагностика на случай регрессии: баг починен в 0.15.2
+    # (cleanup-скрипт больше не удаляет wal_* из-под потока), сейчас должен быть 0.
+    L.append("Флуд waltrace за 5 мин: %s (баг починен в 0.15.2, ожидается 0)"
+             % sh("journalctl -u monad-bft --since '5 min ago' --no-pager 2>/dev/null | grep -c 'waltrace thread stopped'"))
+    need = watchdog_needs_attention()
+    if need:
+        L.append("🔴 ТРЕБУЕТ ВМЕШАТЕЛЬСТВА:\n  %s" % need)
+    L.append("Последнее действие:\n%s" % last)
+    return "\n".join(L)
 
 def fmt_node():
     up = sh("systemctl show monad-bft -p ExecMainStartTimestamp --value")
@@ -272,11 +469,17 @@ def monitor(st):
     for s in SERVICES:
         active = svc_active(s)
         start = svc_start(s)
+        # None = не смогли узнать (осечка systemctl) либо переходная фаза запуска.
+        # Состояние НЕ трогаем и переходных алертов не выпускаем: иначе одна осечка давала
+        # ложный «СЕРВИС УПАЛ», а на следующем тике — ложное «восстановлен», и, что хуже,
+        # затирала prev_start, из-за чего настоящий рестарт оставался незамеченным.
+        if active is None or start is None:
+            continue
         prev_active = st.get("active_" + s)
         prev_start  = st.get("start_" + s)
-        if prev_active is True and not active:
+        if prev_active is True and active is False:
             alerts.append("🔴 СЕРВИС УПАЛ: %s неактивен!" % s)
-        elif prev_active is False and active:
+        elif prev_active is False and active is True:
             alerts.append("✅ Сервис восстановлен: %s снова active" % s)
         if prev_start and start and start != prev_start and active:
             wd = recent_watchdog_action()
@@ -286,18 +489,25 @@ def monitor(st):
         st["start_" + s]  = start
     # sync lag
     s = get_sync()
-    behind = s["height"] is not None and s["lag"] is not None and s["lag"] > SYNC_LAG_WARN
     rpc_dead = s["height"] is None
     if rpc_dead and not st.get("rpc_dead"):
         alerts.append("🔴 RPC :8080 не отвечает")
     elif not rpc_dead and st.get("rpc_dead"):
         alerts.append("✅ RPC :8080 снова отвечает")
     st["rpc_dead"] = rpc_dead
-    if behind and not st.get("behind"):
-        alerts.append("🟡 ОТСТАВАНИЕ СИНКА: lag %ds (блок %s)" % (s["lag"], s["height"]))
-    elif not behind and st.get("behind") and not rpc_dead:
-        alerts.append("✅ Синк восстановлен (lag %ss)" % (s["lag"]))
-    st["behind"] = behind
+    # lag берётся только из eth_getBlockByNumber. Его таймаут при живом eth_blockNumber давал
+    # lag=None → behind=False → «✅ Синк восстановлен (lag None)» посреди реального отставания,
+    # состояние сбрасывалось, и на следующем тике снова «🟡 ОТСТАВАНИЕ». Пинг-понг ложных
+    # восстановлений на весь инцидент. Нет данных — состояние не трогаем.
+    if s["lag"] is None:
+        pass
+    else:
+        behind = s["lag"] > SYNC_LAG_WARN
+        if behind and not st.get("behind"):
+            alerts.append("🟡 ОТСТАВАНИЕ СИНКА: lag %ds (блок %s)" % (s["lag"], s["height"]))
+        elif not behind and st.get("behind"):
+            alerts.append("✅ Синк восстановлен (lag %ds)" % s["lag"])
+        st["behind"] = behind
     # БЛОК НЕ РАСТЁТ (урок инцидента 2026-07-19: 5ч фриза с одним тихим алертом)
     h = s["height"]
     if h is not None:
@@ -337,13 +547,61 @@ def monitor(st):
         elif not warn and st.get("disk_warn"):
             alerts.append("✅ Диск ок: %d%% занято" % d["pct"])
         st["disk_warn"] = warn
-    # waltrace auto-restart counter
-    cnt = int(watchdog_restart_count() or 0)
-    prev_cnt = st.get("wd_count")
-    if prev_cnt is not None and cnt > prev_cnt:
-        alerts.append("⚠️ WALTRACE: watchdog сделал авто-рестарт ноды (всего: %d)\n%s"
-                      % (cnt, last_watchdog_action()))
-    st["wd_count"] = cnt
+
+    # Пересылка алертов Prometheus. Только транзишны: новый фаерящийся алерт и его снятие,
+    # иначе на каждом тике летели бы повторы.
+    pa = prometheus_alerts()
+    if pa is not None:
+        cur = {k: (sev, summ) for k, sev, summ in pa}
+        prev = set(st.get("prom_alerts") or [])
+        for k in sorted(set(cur) - prev):
+            sev, summ = cur[k]
+            icon = "🔴" if sev == "critical" else "🟡"
+            alerts.append("%s PROMETHEUS [%s]: %s\n%s" % (icon, sev or "?", k, summ))
+        for k in sorted(prev - set(cur)):
+            alerts.append("✅ PROMETHEUS: снят алерт %s" % k)
+        st["prom_alerts"] = sorted(cur)
+        if st.get("prom_down"):
+            alerts.append("✅ Prometheus снова отвечает")
+            st["prom_down"] = False
+    elif not st.get("prom_down"):
+        # Недоступный Prometheus = мы ослепли по половине сигналов. Раньше об этом никто
+        # не узнавал, потому что бот про Prometheus вообще не знал.
+        alerts.append("🟡 Prometheus не отвечает — алерты по метрикам не отслеживаются")
+        st["prom_down"] = True
+
+    # Счётчик авто-рестартов watchdog. None = лог недоступен: состояние НЕ трогаем, иначе
+    # обнуление счётчика на следующем удачном тике даёт ложный алерт про авто-рестарт.
+    cnt = watchdog_restart_count()
+    if cnt is not None:
+        # Семантика счётчика изменилась (теперь суммируются оба лога и паттерн шире), поэтому
+        # сохранённое старое значение несопоставимо: без ре-базирования первый же запуск после
+        # обновления выдал бы ложный «watchdog сделал авто-рестарт» на скачке 33 → 66.
+        if st.get("wd_count_schema") != 2:
+            st["wd_count"] = cnt
+            st["wd_count_schema"] = 2
+        prev_cnt = st.get("wd_count")
+        if prev_cnt is not None and cnt > prev_cnt:
+            alerts.append("⚠️ WATCHDOG: сделан авто-рестарт ноды (всего: %d)\n%s"
+                          % (cnt, last_watchdog_action()))
+        st["wd_count"] = cnt
+
+    # Самое тяжёлое сообщение watchdog'а: нода зависла ПОВТОРНО после авто-рестарта и
+    # автоматика сдалась. Раньше оно вообще не покидало лог.
+    need = watchdog_needs_attention()
+    if need and st.get("wd_alert_line") != need:
+        alerts.append("🔴🔴 WATCHDOG СДАЛСЯ — нужно вмешательство вручную:\n%s" % need)
+        st["wd_alert_line"] = need
+
+    # Мёртвый watchdog = нода без авто-восстановления. Раньше его остановка была невидима.
+    alive, wd_age = watchdog_alive()
+    if not alive and not st.get("wd_dead"):
+        alerts.append("🟡 WATCHDOG молчит: логи не обновлялись %s — проверь cron"
+                      % ("никогда" if wd_age is None else "%d мин" % int(wd_age // 60)))
+        st["wd_dead"] = True
+    elif alive and st.get("wd_dead"):
+        alerts.append("✅ WATCHDOG снова пишет в лог")
+        st["wd_dead"] = False
 
     if alerts:
         broadcast("\n\n".join(alerts), st)
