@@ -17,11 +17,39 @@ STATE_PATH = "/opt/monad-tg-bot/state.json"
 # починен апстримом в monad 0.15.2, и этот watchdog снят с cron — его лог заморожен навсегда.
 # Живой сейчас monad-stall-watchdog (зависание консенсуса, урок инцидента 2026-07-19), и его
 # бот не видел вовсе. Смотрим оба: waltrace оставлен на случай возврата, ведущий — stall.
-WATCHDOG_LOGS = [
+# Известные пути — как запасной вариант. Реальный список берём из cron: в природе встречаются
+# как минимум три watchdog-а (monad-stall-watchdog, monad-waltrace-watchdog и monad-watchdog из
+# репозитория monad-tools), и на второй нашей ноде работает именно третий, чей лог
+# /var/log/monad-watchdog.log в захардкоженном списке отсутствовал — мониторинг watchdog там был
+# мёртв целиком, при этом бот бодро рапортовал бы «watchdog молчит».
+WATCHDOG_LOGS_DEFAULT = [
     "/var/log/monad-stall-watchdog.log",
     "/var/log/monad-waltrace-watchdog.log",
+    "/var/log/monad-watchdog.log",
 ]
-WATCHDOG_LOG = WATCHDOG_LOGS[1]   # обратная совместимость для /waltrace
+
+def _discover_watchdog_logs():
+    """Пути логов watchdog из crontab root плюс известные значения по умолчанию."""
+    found = []
+    try:
+        out = subprocess.run("crontab -l 2>/dev/null", shell=True, capture_output=True,
+                             text=True, timeout=10).stdout
+        for line in out.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "watchdog" not in line:
+                continue
+            m = re.search(r">>?\s*(/[^\s]+\.log)", line)
+            if m:
+                found.append(m.group(1))
+    except Exception:
+        pass
+    for p in WATCHDOG_LOGS_DEFAULT:
+        if p not in found:
+            found.append(p)
+    return found
+
+WATCHDOG_LOGS = _discover_watchdog_logs()
+WATCHDOG_LOG = WATCHDOG_LOGS_DEFAULT[1]   # обратная совместимость для /waltrace
 # Действие watchdog связываем с рестартом ноды только если оно не старше этого.
 WATCHDOG_FRESH_SEC = 900
 RPC = "http://localhost:8080"
@@ -313,9 +341,24 @@ def watchdog_needs_attention():
             return out
     return ""
 
+def watchdog_configured():
+    """Установлен ли вообще какой-нибудь watchdog на этом хосте.
+
+    Хост без watchdog — законная конфигурация (проверено: на второй нашей ноде нет ни одного
+    из логов). Без этой проверки бот вечно слал бы «watchdog молчит» там, где молчать нечему.
+    """
+    for p in WATCHDOG_LOGS:
+        if sh("test -f %s && echo yes" % p) == "yes":
+            return True
+    # Лога может не быть, если watchdog поставлен, но ещё ни разу не отработал — смотрим cron.
+    return sh("crontab -l 2>/dev/null | grep -c '^[^#].*monad-.*watchdog'").strip() not in ("", "0")
+
 def watchdog_alive():
-    """(есть_живой_watchdog, возраст_последней_записи). Мёртвый watchdog сам по себе — авария:
-    раньше его остановка была невидима, нода осталась бы без авто-восстановления молча."""
+    """(состояние, возраст). Состояние: True живой / False молчит / None не установлен.
+
+    Мёртвый watchdog — авария: его остановка была невидима, нода осталась бы без
+    авто-восстановления молча. Но «не установлен» — это не авария, а конфигурация.
+    """
     freshest = None
     for p in WATCHDOG_LOGS:
         out = sh("stat -c %%Y %s 2>/dev/null" % p)
@@ -324,7 +367,7 @@ def watchdog_alive():
             if freshest is None or age < freshest:
                 freshest = age
     if freshest is None:
-        return False, None
+        return (False, None) if watchdog_configured() else (None, None)
     return freshest <= 1800, freshest
 
 def watchdog_action_age():
@@ -595,7 +638,10 @@ def monitor(st):
 
     # Мёртвый watchdog = нода без авто-восстановления. Раньше его остановка была невидима.
     alive, wd_age = watchdog_alive()
-    if not alive and not st.get("wd_dead"):
+    if alive is None:
+        # Watchdog на этом хосте не установлен — тишина ожидаема, состояние не трогаем.
+        pass
+    elif not alive and not st.get("wd_dead"):
         alerts.append("🟡 WATCHDOG молчит: логи не обновлялись %s — проверь cron"
                       % ("никогда" if wd_age is None else "%d мин" % int(wd_age // 60)))
         st["wd_dead"] = True
