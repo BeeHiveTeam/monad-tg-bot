@@ -86,3 +86,19 @@ State (Telegram update offset + alert de-dup baseline) is kept in
 ## License
 
 MIT
+
+## Пересылка алертов Prometheus
+
+Если на хосте стоит [monad-grafana](https://github.com/BeeHiveTeam/monad-grafana), бот
+опрашивает `/api/v1/alerts` и шлёт в Telegram только переходы состояния (firing ↔ resolved),
+а не каждый тик. Отдельный Alertmanager не нужен: доставка, повторы, очередь недоставленного
+и список разрешённых чатов уже есть здесь.
+
+```ini
+# config.env
+PROM_URL=http://127.0.0.1:9090     # по умолчанию; менять, если Prometheus не локальный
+```
+
+Правила, которые бот проверяет сам (упавший сервис, локальный RPC, застой блока, диск),
+внесены в `PROM_SKIP_ALERTS` и из Prometheus не берутся — иначе на каждое событие приходило
+бы два сообщения.

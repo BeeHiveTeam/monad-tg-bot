@@ -263,7 +263,10 @@ def get_disk():
 # ни alertmanager в стеке, ни провижининга нотификаций Grafana — /api/v1/alertmanagers
 # отдавал active=0. Проще всего переиспользовать этот бот: доставка, повторы, очередь и
 # список разрешённых чатов у него уже есть.
-PROM_URL = os.environ.get("PROM_URL", "http://127.0.0.1:9090")
+# Из config.env, как и всё остальное. Читать это только из os.environ было нельзя: в юните нет
+# EnvironmentFile, поэтому у оператора не было ни одного штатного способа задать адрес — бот
+# молча ходил бы на localhost:9090 и на хосте с Prometheus в другом месте не пересылал ничего.
+PROM_URL = CFG.get("PROM_URL", os.environ.get("PROM_URL", "http://127.0.0.1:9090")).rstrip("/")
 # Эти алерты бот проверяет сам, напрямую — пересылать их значило бы дублировать сообщения.
 PROM_SKIP_ALERTS = {
     "MonadServiceDown", "MonadLocalRpcDown",
