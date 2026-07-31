@@ -54,6 +54,8 @@ WATCHDOG_LOG = WATCHDOG_LOGS_DEFAULT[1]   # обратная совместим�
 WATCHDOG_FRESH_SEC = 900
 RPC = "http://localhost:8080"
 SERVICES = ["monad-bft", "monad-execution", "monad-rpc"]
+# Сколько рестартов за один цикл мониторинга считать crash-loop'ом, а не единичным рестартом.
+CRASHLOOP_RESTARTS = int(os.environ.get("CRASHLOOP_RESTARTS", "2"))
 HOST = os.uname().nodename
 
 # ---------- config ----------
@@ -231,6 +233,22 @@ def svc_start(s):
     ok, out = sh_try("systemctl show %s -p ExecMainStartTimestamp --value" % s)
     return out if ok else None
 
+def svc_restarts(s):
+    """NRestarts или None. Счётчик рестартов, выполненных самим systemd (Restart=on-failure).
+
+    Зачем отдельно от svc_active: сервис в crash-loop проходит цикл
+    active -> failed -> auto-restart -> activating -> active за считаные секунды. Тик
+    мониторинга почти всегда застаёт его либо в переходной фазе (svc_active -> None,
+    состояние не трогаем), либо в короткое окно active (-> True). Значение False не
+    наблюдается практически никогда, поэтому «СЕРВИС УПАЛ» не срабатывает, и сервис,
+    падающий по десять раз в минуту, выглядит совершенно здоровым. Растущий NRestarts —
+    признак, который от фазы опроса не зависит.
+    """
+    ok, out = sh_try("systemctl show %s -p NRestarts --value" % s)
+    if not ok or not out.strip().isdigit():
+        return None
+    return int(out.strip())
+
 def get_sync():
     syncing = rpc("eth_syncing")
     blk = rpc("eth_blockNumber")
@@ -245,10 +263,34 @@ def get_sync():
 def get_disk():
     # df подвисает именно при проблемах с IO, поэтому «не выполнилось» и «пусто» надо
     # различать: раньше оба давали pct=None и проверка диска молча выключалась.
-    ok, out = sh_try("df -P / | tail -1")  # md3
+    # По ВСЕМ локальным ФС, а не только по «/». Правила NodeDiskAlmostFull и NodeDiskFillingUp
+    # внесены в PROM_SKIP_ALERTS, потому что бот «и так проверяет диск» — но проверял он одну
+    # файловую систему, а правила покрывали все. Заполнение /var или отдельного тома оставалось
+    # не покрытым ничем: Prometheus молчал по договорённости, бот туда не смотрел.
+    # Берём самую заполненную ФС — она и определяет, когда звать людей.
+    ok, out = sh_try("df -P -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs 2>/dev/null | tail -n +2")
     if not ok:
         return {"pct": None, "avail_gb": None, "known": False}
-    parts = out.split()
+    worst = None
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 6:
+            continue
+        # Только ФС на реальном блочном устройстве. Псевдо-ФС дают бессмысленный процент:
+        # /sys/firmware/efi/efivars на этой машине показывает 38% при размере в килобайты и
+        # стала бы «самой заполненной», то есть источником вечного ложного алерта.
+        if not parts[0].startswith("/dev/"):
+            continue
+        try:
+            pct = int(parts[4].rstrip("%"))
+            avail_gb = int(parts[3]) / 1024 / 1024
+        except ValueError:
+            continue
+        if worst is None or pct > worst["pct"]:
+            worst = {"pct": pct, "avail_gb": round(avail_gb, 1), "known": True, "mount": parts[5]}
+    if worst:
+        return worst
+    parts = []
     if len(parts) >= 5:
         try:
             pct = int(parts[4].rstrip("%"))
@@ -270,7 +312,10 @@ PROM_URL = CFG.get("PROM_URL", os.environ.get("PROM_URL", "http://127.0.0.1:9090
 # Эти алерты бот проверяет сам, напрямую — пересылать их значило бы дублировать сообщения.
 PROM_SKIP_ALERTS = {
     "MonadServiceDown", "MonadLocalRpcDown",
-    "NodeDiskAlmostFull", "NodeDiskFillingUp",
+    # NodeDiskAlmostFull дублируется локальной проверкой (теперь по всем ФС) — пропускаем.
+    # NodeDiskFillingUp НЕ пропускаем: это predict_linear, прогноз исчерпания за 4 часа.
+    # Локального аналога у бота нет и быть не может — он видит только текущий процент.
+    "NodeDiskAlmostFull",
 }
 
 def prometheus_alerts():
@@ -402,9 +447,26 @@ def watchdog_restart_count():
     """
     total, seen = 0, False
     for p in WATCHDOG_LOGS:
-        out = sh("grep -cE 'restarting|restarted' %s 2>/dev/null" % p)
-        if out.isdigit():
-            total += int(out); seen = True
+        # Считаем СОБЫТИЯ, а не строки. Два независимых искажения жили в одной команде:
+        #
+        # 1. Двойной счёт. Один рестарт пишет обе строки — "restarting monad-bft to clear ..."
+        #    и следом "restarted monad-bft — flood was ...". На нашем логе это ровно 33 и 33,
+        #    то есть счётчик показывал 66 при 33 реальных рестартах.
+        # 2. Инверсия. monad-watchdog логирует отказы от рестарта теми же словами:
+        #    "Will NOT auto-restart", "NOT auto-restarting (would miss slots)",
+        #    "Not auto-restarting on a blind 0", "NOT restarting". Каждый такой отказ —
+        #    то есть срабатывание предохранителя — засчитывался как рестарт.
+        #
+        # Берём максимум из двух маркеров: watchdog может писать любой один из них, но
+        # на одно событие не больше одного каждого.
+        # Отказы ОТФИЛЬТРОВЫВАЮТСЯ до подсчёта, а не вычитаются после: строка
+        # "NOT auto-restarting" сама содержит "restarting", поэтому вычитание уводило
+        # результат в минус и обнуляло настоящие рестарты.
+        neg = "not[[:space:]]+(auto-)?restart"
+        n_ing = sh("grep -iE 'restarting' %s 2>/dev/null | grep -icvE '%s'" % (p, neg))
+        n_ed  = sh("grep -iE 'restarted'  %s 2>/dev/null | grep -icvE '%s'" % (p, neg))
+        if n_ing.isdigit() and n_ed.isdigit():
+            total += max(int(n_ing), int(n_ed)); seen = True
     return total if seen else None
 
 def node_version():
@@ -434,7 +496,8 @@ def fmt_status():
     d = get_disk()
     if d["pct"] is not None:
         icon = "✅" if d["pct"] < DISK_WARN_PCT else "🟡"
-        L.append("Диск /: %s %d%% занято, %s ГБ свободно" % (icon, d["pct"], d["avail_gb"]))
+        L.append("Диск %s: %s %d%% занято, %s ГБ свободно"
+                 % (d.get("mount", "/"), icon, d["pct"], d["avail_gb"]))
     L.append("Версия: %s" % node_version())
     _wc = watchdog_restart_count()
     L.append("Авто-рестартов watchdog всего: %s" % ("н/д" if _wc is None else _wc))
@@ -484,7 +547,9 @@ def fmt_waltrace():
 
 def fmt_node():
     up = sh("systemctl show monad-bft -p ExecMainStartTimestamp --value")
-    peers = sh("journalctl -u monad-bft --since '1 min ago' --no-pager 2>/dev/null | grep -oE 'node_id\":\"02[0-9a-f]{6}' | sort -u | wc -l")
+    # Префикс сжатого secp256k1-ключа — 02 ИЛИ 03, в зависимости от чётности Y. Шаблон ловил
+    # только 02, то есть ровно половину сети: на живой ноде 94 против 196 уникальных пиров.
+    peers = sh("journalctl -u monad-bft --since '1 min ago' --no-pager 2>/dev/null | grep -oE 'node_id\":\"0[23][0-9a-f]{6}' | sort -u | wc -l")
     return ("Нода %s\nВерсия: %s\nmonad-bft с: %s\nУникальных пиров в логе/мин: %s"
             % (HOST, node_version(), up, peers))
 
@@ -527,6 +592,18 @@ def monitor(st):
             alerts.append("🔴 СЕРВИС УПАЛ: %s неактивен!" % s)
         elif prev_active is False and active is True:
             alerts.append("✅ Сервис восстановлен: %s снова active" % s)
+        # crash-loop: NRestarts растёт, даже если фаза опроса всё время «здоровая»
+        nr = svc_restarts(s)
+        prev_nr = st.get("nrestarts_" + s)
+        if nr is not None:
+            if prev_nr is not None and nr > prev_nr:
+                delta = nr - prev_nr
+                if delta >= CRASHLOOP_RESTARTS:
+                    alerts.append("🔴 CRASH-LOOP: %s перезапущен systemd %d раз(а) за цикл (всего %d)"
+                                  % (s, delta, nr))
+                else:
+                    alerts.append("🟡 %s перезапущен systemd (%d раз всего)" % (s, nr))
+            st["nrestarts_" + s] = nr
         if prev_start and start and start != prev_start and active:
             wd = recent_watchdog_action()
             tag = " (watchdog/waltrace — ожидаемо)" if (s == "monad-bft" and wd and "restart" in wd.lower()) else ""
@@ -589,7 +666,8 @@ def monitor(st):
     if d["pct"] is not None:
         warn = d["pct"] >= DISK_WARN_PCT
         if warn and not st.get("disk_warn"):
-            alerts.append("🟡 ДИСК: / занят на %d%% (%s ГБ свободно)" % (d["pct"], d["avail_gb"]))
+            alerts.append("🟡 ДИСК: %s занят на %d%% (%s ГБ свободно)"
+                          % (d.get("mount", "/"), d["pct"], d["avail_gb"]))
         elif not warn and st.get("disk_warn"):
             alerts.append("✅ Диск ок: %d%% занято" % d["pct"])
         st["disk_warn"] = warn
