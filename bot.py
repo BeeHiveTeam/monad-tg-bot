@@ -56,6 +56,8 @@ RPC = "http://localhost:8080"
 SERVICES = ["monad-bft", "monad-execution", "monad-rpc"]
 # Сколько рестартов за один цикл мониторинга считать crash-loop'ом, а не единичным рестартом.
 CRASHLOOP_RESTARTS = int(os.environ.get("CRASHLOOP_RESTARTS", "2"))
+# Порог флуда waltrace за 5 мин. Штатно 0; на регрессии 2026-07-31 было ~67 000.
+WALTRACE_FLOOD_5MIN = int(os.environ.get("WALTRACE_FLOOD_5MIN", "100"))
 HOST = os.uname().nodename
 
 # ---------- config ----------
@@ -661,6 +663,22 @@ def monitor(st):
             st["last_realert"] = now
     else:
         st["last_realert"] = 0
+    # Флуд waltrace. Проверка существовала только в /status — то есть срабатывала, лишь если
+    # человек сам спросит. 2026-07-31 регрессия на 0.15.2 (сообщение «waltrace thread stopped»,
+    # ~220 строк/с) шла 4.5 часа, и ни один канал о ней не сообщил: правила в Prometheus нет,
+    # метрики нет, в monitor() счётчик не заглядывал. Пассивный индикатор — не мониторинг.
+    ok_wt, wt = sh_try("journalctl -u monad-bft --since '5 min ago' --no-pager 2>/dev/null "
+                       "| grep -c 'waltrace thread stopped'", timeout=45)
+    if ok_wt and wt.isdigit():
+        _n = int(wt)
+        flooding = _n >= WALTRACE_FLOOD_5MIN
+        if flooding and not st.get("waltrace_flood"):
+            alerts.append("🔴 ФЛУД waltrace: %d строк «waltrace thread stopped» за 5 мин. "
+                          "Поток waltrace мёртв, журнал забивается. Лечится рестартом monad-bft." % _n)
+        elif not flooding and st.get("waltrace_flood"):
+            alerts.append("✅ Флуд waltrace прекратился (%d за 5 мин)" % _n)
+        st["waltrace_flood"] = flooding
+
     # disk
     d = get_disk()
     if d["pct"] is not None:
