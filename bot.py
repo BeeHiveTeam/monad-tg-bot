@@ -477,6 +477,24 @@ def node_version():
     return m.group(1) if m else (v[:40] or "?")
 
 # ---------- formatted reports (for commands) ----------
+def sync_symbol(s):
+    """
+    Состояние синхронизации по ОТСТАВАНИЮ, а не по флагу eth_syncing.
+
+    eth_syncing=false у Monad значит «нет активного процесса синхронизации» — это же
+    возвращает и нода, которая встала намертво. Единственный честный признак — возраст
+    последнего блока. Три состояния, а не два: измерили и норма, измерили и отстаём,
+    измерить не смогли.
+    """
+    if s["lag"] is None:
+        return "❔ lag не измерен"
+    if s["lag"] > SYNC_LAG_WARN:
+        return "🔴 ОТСТАЁТ"
+    if s["syncing"] not in (False, None):
+        return "🟡 syncing"
+    return "✅ в синке"
+
+
 def fmt_status():
     L = ["📟 Monad node — %s" % HOST]
     _st = {s: svc_active(s) for s in SERVICES}
@@ -490,7 +508,11 @@ def fmt_status():
         L.append("Сервисы: ✅ все active")
     s = get_sync()
     if s["height"] is not None:
-        sync_txt = "✅ у типа" if s["syncing"] in (False, None) else "🟡 syncing"
+        # Значок ставится по lag, а НЕ по eth_syncing. eth_syncing=false означает лишь
+        # «процесс синхронизации не идёт», и это же значение отдаёт намертво вставшая нода:
+        # 2026-08-07 нода стояла на одном блоке и отставала на тысячи, а /status рисовал ✅.
+        # lag=None — это «не смог измерить», отдельное третье состояние, не «здоров».
+        sync_txt = sync_symbol(s)
         lag = "?" if s["lag"] is None else "%ds" % s["lag"]
         L.append("Синк: %s  блок %s  lag %s" % (sync_txt, s["height"], lag))
     else:
@@ -510,7 +532,7 @@ def fmt_sync():
     if s["height"] is None:
         return "🔴 RPC :8080 не отвечает"
     return ("Синк %s\nblock: %s\nlag: %s\neth_syncing: %s" % (
-        "✅ у типа" if s["syncing"] in (False, None) else "🟡 syncing",
+        sync_symbol(s),
         s["height"], "?" if s["lag"] is None else "%ds" % s["lag"], s["syncing"]))
 
 def fmt_disk():
