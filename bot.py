@@ -80,6 +80,8 @@ TOKEN = CFG.get("BOT_TOKEN", "").strip()
 ALLOWED = set(x.strip() for x in CFG.get("ALLOWED_CHAT_IDS", "").split(",") if x.strip())
 CHECK_INTERVAL   = int(CFG.get("CHECK_INTERVAL", "60"))
 DISK_WARN_PCT    = int(CFG.get("DISK_WARN_PCT", "85"))
+# UI language: en (default), ru or de. Also switchable at runtime with the 🌐 button or /lang.
+_cfg_lang = CFG.get("LANG", "en").strip().lower()
 SYNC_LAG_WARN    = int(CFG.get("SYNC_LAG_WARN_SEC", "30"))
 STALL_TICKS      = int(CFG.get("STALL_TICKS", "5"))       # тиков без роста блока до алерта (5*60с=5мин)
 REALERT_SEC      = int(CFG.get("REALERT_SEC", "1800"))    # повтор алерта критического состояния, сек
@@ -109,11 +111,127 @@ def tg(method, params=None, timeout=35):
         sys.stderr.write("tg %s error: %s\n" % (method, e)); sys.stderr.flush()
         return None
 
-KEYBOARD = json.dumps({"inline_keyboard": [
-    [{"text": "📟 Статус", "callback_data": "status"}, {"text": "🔄 Синк", "callback_data": "sync"}],
-    [{"text": "💾 Диск", "callback_data": "disk"}, {"text": "🐕 Waltrace", "callback_data": "waltrace"}],
-    [{"text": "🖥 Нода", "callback_data": "node"}, {"text": "❓ Помощь", "callback_data": "help"}],
-]})
+# ── i18n ──────────────────────────────────────────────────────────────────────
+# One bot, one operator chat, so language is a single setting rather than per-user. Default
+# English; LANG=en|ru|de in config.env sets it, the 🌐 button and /lang cycle at runtime.
+# Strings keep %s formatting, so tr("key") % args works exactly like the literals it replaced.
+DEFAULT_LANG = _cfg_lang if _cfg_lang in ("en", "ru", "de") else "en"
+_lang = DEFAULT_LANG
+
+T = {
+  # buttons — the language button shows the CURRENT language, not the next one
+  "b_status": {"en": "📟 Status",  "ru": "📟 Статус",   "de": "📟 Status"},
+  "b_sync":   {"en": "🔄 Sync",    "ru": "🔄 Синк",     "de": "🔄 Sync"},
+  "b_disk":   {"en": "💾 Disk",    "ru": "💾 Диск",     "de": "💾 Platte"},
+  "b_wal":    {"en": "🐕 Waltrace","ru": "🐕 Waltrace", "de": "🐕 Waltrace"},
+  "b_node":   {"en": "🖥 Node",    "ru": "🖥 Нода",     "de": "🖥 Node"},
+  "b_help":   {"en": "❓ Help",     "ru": "❓ Помощь",   "de": "❓ Hilfe"},
+  "b_lang":   {"en": "🌐 EN",      "ru": "🌐 RU",       "de": "🌐 DE"},
+
+  # sync state
+  "s_nolag":  {"en": "❔ lag not measured", "ru": "❔ lag не измерен", "de": "❔ Lag nicht messbar"},
+  "s_behind": {"en": "🔴 BEHIND",           "ru": "🔴 ОТСТАЁТ",       "de": "🔴 ZURÜCK"},
+  "s_sync":   {"en": "🟡 syncing",          "ru": "🟡 syncing",       "de": "🟡 syncing"},
+  "s_ok":     {"en": "✅ in sync",           "ru": "✅ в синке",       "de": "✅ synchron"},
+
+  # /status
+  "st_down":  {"en": "Services: 🔴 down: ",  "ru": "Сервисы: 🔴 down: ",  "de": "Dienste: 🔴 down: "},
+  "st_unk":   {"en": "Services: ❔ could not query: ", "ru": "Сервисы: ❔ не удалось опросить: ", "de": "Dienste: ❔ nicht abfragbar: "},
+  "st_ok":    {"en": "Services: ✅ all active", "ru": "Сервисы: ✅ все active", "de": "Dienste: ✅ alle aktiv"},
+  "st_sync":  {"en": "Sync: %s  block %s  lag %s", "ru": "Синк: %s  блок %s  lag %s", "de": "Sync: %s  Block %s  Lag %s"},
+  "st_norpc": {"en": "Sync: 🔴 RPC not responding", "ru": "Синк: 🔴 RPC не отвечает", "de": "Sync: 🔴 RPC antwortet nicht"},
+  "st_disk":  {"en": "Disk %s: %s %d%% used, %s GB free", "ru": "Диск %s: %s %d%% занято, %s ГБ свободно", "de": "Platte %s: %s %d%% belegt, %s GB frei"},
+  "st_ver":   {"en": "Version: %s", "ru": "Версия: %s", "de": "Version: %s"},
+  "st_wdr":   {"en": "Watchdog auto-restarts total: %s", "ru": "Авто-рестартов watchdog всего: %s", "de": "Watchdog-Neustarts gesamt: %s"},
+  "na":       {"en": "n/a", "ru": "н/д", "de": "k.A."},
+
+  # /sync /disk /node
+  "sy_norpc": {"en": "🔴 RPC :8080 not responding", "ru": "🔴 RPC :8080 не отвечает", "de": "🔴 RPC :8080 antwortet nicht"},
+  "sy_body":  {"en": "Sync %s\nblock: %s\nlag: %s\neth_syncing: %s", "ru": "Синк %s\nblock: %s\nlag: %s\neth_syncing: %s", "de": "Sync %s\nBlock: %s\nLag: %s\neth_syncing: %s"},
+  "dk_body":  {"en": "Disk /: %s\n%s", "ru": "Диск /: %s\n%s", "de": "Platte /: %s\n%s"},
+  "dk_used":  {"en": "%d%% used, %s GB free", "ru": "%d%% занято, %s ГБ свободно", "de": "%d%% belegt, %s GB frei"},
+  "nd_body":  {"en": "Node %s\nVersion: %s\nmonad-bft since: %s\nUnique peers in log/min: %s", "ru": "Нода %s\nВерсия: %s\nmonad-bft с: %s\nУникальных пиров в логе/мин: %s", "de": "Node %s\nVersion: %s\nmonad-bft seit: %s\nEindeutige Peers im Log/Min: %s"},
+
+  # /waltrace
+  "wd_title": {"en": "Node watchdogs", "ru": "Watchdog-и ноды", "de": "Node-Watchdogs"},
+  "wd_nolog": {"en": "  %s: no log", "ru": "  %s: лога нет", "de": "  %s: kein Log"},
+  "wd_entry": {"en": "  %s: %s, written %d min ago", "ru": "  %s: %s, запись %d мин назад", "de": "  %s: %s, Eintrag vor %d Min"},
+  "wd_alive": {"en": "alive", "ru": "живой", "de": "aktiv"},
+  "wd_quiet": {"en": "SILENT", "ru": "МОЛЧИТ", "de": "STUMM"},
+  "wd_total": {"en": "Auto-restarts total: %s", "ru": "Всего авто-рестартов: %s", "de": "Neustarts gesamt: %s"},
+  "wd_flood": {"en": "waltrace flood in 5 min: %s (fixed in 0.15.2, expect 0)", "ru": "Флуд waltrace за 5 мин: %s (баг починен в 0.15.2, ожидается 0)", "de": "waltrace-Flut in 5 Min: %s (in 0.15.2 behoben, erwartet 0)"},
+  "wd_need":  {"en": "🔴 NEEDS ATTENTION:\n  %s", "ru": "🔴 ТРЕБУЕТ ВМЕШАТЕЛЬСТВА:\n  %s", "de": "🔴 EINGRIFF NÖTIG:\n  %s"},
+  "wd_last":  {"en": "Last action:\n%s", "ru": "Последнее действие:\n%s", "de": "Letzte Aktion:\n%s"},
+  "wd_none":  {"en": "no entries", "ru": "нет записей", "de": "keine Einträge"},
+  "wd_stale": {"en": "\n⚠️ entry is old (%s ago)", "ru": "\n⚠️ запись старая (%s назад)", "de": "\n⚠️ Eintrag ist alt (vor %s)"},
+  "t_hours":  {"en": "%d h", "ru": "%d ч", "de": "%d Std"},
+  "t_never":  {"en": "never", "ru": "никогда", "de": "nie"},
+  "t_mins":   {"en": "%d min", "ru": "%d мин", "de": "%d Min"},
+
+  # alerts
+  "a_svc_down": {"en": "🔴 SERVICE DOWN: %s is not active!", "ru": "🔴 СЕРВИС УПАЛ: %s неактивен!", "de": "🔴 DIENST AUSGEFALLEN: %s ist nicht aktiv!"},
+  "a_svc_up":   {"en": "✅ Service recovered: %s is active again", "ru": "✅ Сервис восстановлен: %s снова active", "de": "✅ Dienst wiederhergestellt: %s ist wieder aktiv"},
+  "a_svc_still":{"en": "🔴 %s still down", "ru": "🔴 %s всё ещё down", "de": "🔴 %s weiterhin ausgefallen"},
+  "a_restart":  {"en": "🔄 RESTART: %s restarted%s\nstarted: %s", "ru": "🔄 РЕСТАРТ: %s перезапущен%s\nстарт: %s", "de": "🔄 NEUSTART: %s neu gestartet%s\nStart: %s"},
+  "a_expected": {"en": " (watchdog/waltrace — expected)", "ru": " (watchdog/waltrace — ожидаемо)", "de": " (Watchdog/waltrace — erwartet)"},
+  "a_crashloop":{"en": "🔴 CRASH-LOOP: %s restarted by systemd %d time(s) this cycle (total %d)", "ru": "🔴 CRASH-LOOP: %s перезапущен systemd %d раз(а) за цикл (всего %d)", "de": "🔴 CRASH-LOOP: %s von systemd %d mal in diesem Zyklus neu gestartet (gesamt %d)"},
+  "a_sysrest":  {"en": "🟡 %s restarted by systemd (%d total)", "ru": "🟡 %s перезапущен systemd (%d раз всего)", "de": "🟡 %s von systemd neu gestartet (%d gesamt)"},
+  "a_rpc_down": {"en": "🔴 RPC :8080 not responding", "ru": "🔴 RPC :8080 не отвечает", "de": "🔴 RPC :8080 antwortet nicht"},
+  "a_rpc_still":{"en": "🔴 RPC still not responding", "ru": "🔴 RPC всё ещё не отвечает", "de": "🔴 RPC antwortet weiterhin nicht"},
+  "a_rpc_up":   {"en": "✅ RPC :8080 responding again", "ru": "✅ RPC :8080 снова отвечает", "de": "✅ RPC :8080 antwortet wieder"},
+  "a_stuck":    {"en": "🔴 BLOCKS NOT ADVANCING: height stuck at %s (~%d min). Consensus is down!", "ru": "🔴 БЛОКИ НЕ РАСТУТ: высота застряла на %s (~%d мин). Consensus стоит!", "de": "🔴 BLÖCKE STEHEN: Höhe bei %s festgefahren (~%d Min). Consensus steht!"},
+  "a_stuck_still":{"en": "🔴 STILL STUCK: block %s is not advancing", "ru": "🔴 ВСЁ ЕЩЁ СТОИТ: блок %s не растёт", "de": "🔴 STEHT WEITERHIN: Block %s wächst nicht"},
+  "a_stuck_ok": {"en": "✅ Blocks advancing again: %s", "ru": "✅ Блоки снова растут: %s", "de": "✅ Blöcke wachsen wieder: %s"},
+  "a_lag":      {"en": "🟡 SYNC LAG: %ds behind (block %s)", "ru": "🟡 ОТСТАВАНИЕ СИНКА: lag %ds (блок %s)", "de": "🟡 SYNC-RÜCKSTAND: %ds (Block %s)"},
+  "a_lag_ok":   {"en": "✅ Sync recovered (lag %ds)", "ru": "✅ Синк восстановлен (lag %ds)", "de": "✅ Sync wiederhergestellt (Lag %ds)"},
+  "a_disk":     {"en": "🟡 DISK: %s is %d%% full (%s GB free)", "ru": "🟡 ДИСК: %s занят на %d%% (%s ГБ свободно)", "de": "🟡 PLATTE: %s zu %d%% voll (%s GB frei)"},
+  "a_disk_ok":  {"en": "✅ Disk ok: %d%% used", "ru": "✅ Диск ок: %d%% занято", "de": "✅ Platte ok: %d%% belegt"},
+  "a_wd_rest":  {"en": "⚠️ WATCHDOG: auto-restarted the node (total: %d)\n%s", "ru": "⚠️ WATCHDOG: сделан авто-рестарт ноды (всего: %d)\n%s", "de": "⚠️ WATCHDOG: Node automatisch neu gestartet (gesamt: %d)\n%s"},
+  "a_wd_gave":  {"en": "🔴🔴 WATCHDOG GAVE UP — manual intervention needed:\n%s", "ru": "🔴🔴 WATCHDOG СДАЛСЯ — нужно вмешательство вручную:\n%s", "de": "🔴🔴 WATCHDOG HAT AUFGEGEBEN — manueller Eingriff nötig:\n%s"},
+  "a_wd_quiet": {"en": "🟡 WATCHDOG SILENT: logs not updated for %s — check cron", "ru": "🟡 WATCHDOG молчит: логи не обновлялись %s — проверь cron", "de": "🟡 WATCHDOG STUMM: Logs seit %s nicht aktualisiert — cron prüfen"},
+  "a_wd_back":  {"en": "✅ WATCHDOG is writing to the log again", "ru": "✅ WATCHDOG снова пишет в лог", "de": "✅ WATCHDOG schreibt wieder ins Log"},
+  "a_flood":    {"en": "🔴 waltrace FLOOD: %d lines of \u00abwaltrace thread stopped\u00bb in 5 min. ", "ru": "🔴 ФЛУД waltrace: %d строк «waltrace thread stopped» за 5 мин. ", "de": "🔴 waltrace-FLUT: %d Zeilen \u00abwaltrace thread stopped\u00bb in 5 Min. "},
+  "a_flood2":   {"en": "The waltrace thread is dead and the journal is filling up. Restart monad-bft to fix.", "ru": "Поток waltrace мёртв, журнал забивается. Лечится рестартом monad-bft.", "de": "Der waltrace-Thread ist tot und das Journal läuft voll. Neustart von monad-bft behebt es."},
+  "a_flood_ok": {"en": "✅ waltrace flood stopped (%d in 5 min)", "ru": "✅ Флуд waltrace прекратился (%d за 5 мин)", "de": "✅ waltrace-Flut beendet (%d in 5 Min)"},
+  "a_prom_down":{"en": "🟡 Prometheus not responding — metric alerts are not being tracked", "ru": "🟡 Prometheus не отвечает — алерты по метрикам не отслеживаются", "de": "🟡 Prometheus antwortet nicht — Metrik-Alarme werden nicht verfolgt"},
+  "a_prom_up":  {"en": "✅ Prometheus responding again", "ru": "✅ Prometheus снова отвечает", "de": "✅ Prometheus antwortet wieder"},
+  "a_prom_clr": {"en": "✅ PROMETHEUS: alert cleared %s", "ru": "✅ PROMETHEUS: снят алерт %s", "de": "✅ PROMETHEUS: Alarm aufgehoben %s"},
+  "a_repeat":   {"en": "(repeat) ", "ru": "(повтор) ", "de": "(Wiederholung) "},
+  "a_reminder": {"en": "⏰ REMINDER (repeats every %d min):\n", "ru": "⏰ НАПОМИНАНИЕ (повтор каждые %d мин):\n", "de": "⏰ ERINNERUNG (alle %d Min):\n"},
+
+  # misc
+  "m_started":  {"en": "🤖 monad-tg-bot started on %s. /help for commands.", "ru": "🤖 monad-tg-bot запущен на %s. /help — команды.", "de": "🤖 monad-tg-bot gestartet auf %s. /help für Befehle."},
+  "m_unauth":   {"en": "⛔ Not authorised. Your chat_id: %s", "ru": "⛔ Не авторизован. Твой chat_id: %s", "de": "⛔ Nicht autorisiert. Deine chat_id: %s"},
+  "m_chatid":   {"en": "chat_id: %s\nAdd it to ALLOWED_CHAT_IDS in config.env and restart the service.\n\n%s", "ru": "chat_id: %s\nДобавь его в ALLOWED_CHAT_IDS в config.env и перезапусти сервис.\n\n%s", "de": "chat_id: %s\nTrage sie in ALLOWED_CHAT_IDS in config.env ein und starte den Dienst neu.\n\n%s"},
+  "m_unknown":  {"en": "Unknown command. /help", "ru": "Неизвестная команда. /help", "de": "Unbekannter Befehl. /help"},
+  "m_lang":     {"en": "Language: English. Tap 🌐 or /lang to cycle.", "ru": "Язык: русский. Нажмите 🌐 или /lang для смены.", "de": "Sprache: Deutsch. 🌐 oder /lang zum Wechseln."},
+  "help":       {"en": ("Monad node bot — %s\n\n"
+                        "/status — overview\n/sync — sync state\n/disk — disk and resources\n"
+                        "/waltrace — watchdog/waltrace\n/node — version/uptime/peers\n"
+                        "/id — show chat id\n/lang — switch language\n/help — this message"),
+                 "ru": ("Monad node bot — %s\n\n"
+                        "/status — общая сводка\n/sync — статус синхронизации\n/disk — диск/ресурсы\n"
+                        "/waltrace — watchdog/waltrace\n/node — версия/аптайм/пиры\n"
+                        "/id — показать chat id\n/lang — сменить язык\n/help — помощь"),
+                 "de": ("Monad node bot — %s\n\n"
+                        "/status — Übersicht\n/sync — Sync-Status\n/disk — Platte und Ressourcen\n"
+                        "/waltrace — Watchdog/waltrace\n/node — Version/Laufzeit/Peers\n"
+                        "/id — chat id anzeigen\n/lang — Sprache wechseln\n/help — diese Nachricht")},
+}
+
+
+def tr(key):
+    return T[key].get(_lang, T[key]["en"])
+
+
+def keyboard():
+    """Inline keyboard in the current language, with a language toggle."""
+    return json.dumps({"inline_keyboard": [
+        [{"text": tr("b_status"), "callback_data": "status"}, {"text": tr("b_sync"), "callback_data": "sync"}],
+        [{"text": tr("b_disk"), "callback_data": "disk"}, {"text": tr("b_wal"), "callback_data": "waltrace"}],
+        [{"text": tr("b_node"), "callback_data": "node"}, {"text": tr("b_help"), "callback_data": "help"}],
+        [{"text": tr("b_lang"), "callback_data": "lang"}],
+    ]})
 
 def send(chat_id, text, kb=False):
     # plain text, split if very long; True если все части доставлены
@@ -124,7 +242,7 @@ def send(chat_id, text, kb=False):
         params = {"chat_id": chat_id, "text": chunk,
                   "disable_web_page_preview": "true"}
         if kb and n == len(chunks) - 1:
-            params["reply_markup"] = KEYBOARD
+            params["reply_markup"] = keyboard()
         r = tg("sendMessage", params)
         if not (r and r.get("ok")):
             ok = False
@@ -146,7 +264,7 @@ def retry_pending(st):
         return
     left = []
     for a in pend[:20]:
-        if send(a["cid"], "(повтор) " + a["text"], kb=True):
+        if send(a["cid"], tr("a_repeat") + a["text"], kb=True):
             sys.stderr.write("queued alert delivered to %s\n" % a["cid"])
         else:
             left.append(a)
@@ -487,12 +605,12 @@ def sync_symbol(s):
     измерить не смогли.
     """
     if s["lag"] is None:
-        return "❔ lag не измерен"
+        return tr("s_nolag")
     if s["lag"] > SYNC_LAG_WARN:
-        return "🔴 ОТСТАЁТ"
+        return tr("s_behind")
     if s["syncing"] not in (False, None):
-        return "🟡 syncing"
-    return "✅ в синке"
+        return tr("s_sync")
+    return tr("s_ok")
 
 
 def fmt_status():
@@ -501,11 +619,11 @@ def fmt_status():
     bad = [s for s, v in _st.items() if v is False]
     unk = [s for s, v in _st.items() if v is None]
     if bad:
-        L.append("Сервисы: 🔴 down: " + ", ".join(bad))
+        L.append(tr("st_down") + ", ".join(bad))
     elif unk:
-        L.append("Сервисы: ❔ не удалось опросить: " + ", ".join(unk))
+        L.append(tr("st_unk") + ", ".join(unk))
     else:
-        L.append("Сервисы: ✅ все active")
+        L.append(tr("st_ok"))
     s = get_sync()
     if s["height"] is not None:
         # Значок ставится по lag, а НЕ по eth_syncing. eth_syncing=false означает лишь
@@ -514,59 +632,58 @@ def fmt_status():
         # lag=None — это «не смог измерить», отдельное третье состояние, не «здоров».
         sync_txt = sync_symbol(s)
         lag = "?" if s["lag"] is None else "%ds" % s["lag"]
-        L.append("Синк: %s  блок %s  lag %s" % (sync_txt, s["height"], lag))
+        L.append(tr("st_sync") % (sync_txt, s["height"], lag))
     else:
-        L.append("Синк: 🔴 RPC не отвечает")
+        L.append(tr("st_norpc"))
     d = get_disk()
     if d["pct"] is not None:
         icon = "✅" if d["pct"] < DISK_WARN_PCT else "🟡"
-        L.append("Диск %s: %s %d%% занято, %s ГБ свободно"
-                 % (d.get("mount", "/"), icon, d["pct"], d["avail_gb"]))
-    L.append("Версия: %s" % node_version())
+        L.append(tr("st_disk") % (d.get("mount", "/"), icon, d["pct"], d["avail_gb"]))
+    L.append(tr("st_ver") % node_version())
     _wc = watchdog_restart_count()
-    L.append("Авто-рестартов watchdog всего: %s" % ("н/д" if _wc is None else _wc))
+    L.append(tr("st_wdr") % (tr("na") if _wc is None else _wc))
     return "\n".join(L)
 
 def fmt_sync():
     s = get_sync()
     if s["height"] is None:
-        return "🔴 RPC :8080 не отвечает"
-    return ("Синк %s\nblock: %s\nlag: %s\neth_syncing: %s" % (
+        return tr("sy_norpc")
+    return (tr("sy_body") % (
         sync_symbol(s),
         s["height"], "?" if s["lag"] is None else "%ds" % s["lag"], s["syncing"]))
 
 def fmt_disk():
     d = get_disk()
     top = sh("df -h / | tail -1")
-    return "Диск /: %s\n%s" % (
-        "—" if d["pct"] is None else "%d%% занято, %s ГБ свободно" % (d["pct"], d["avail_gb"]), top)
+    return tr("dk_body") % (
+        "—" if d["pct"] is None else tr("dk_used") % (d["pct"], d["avail_gb"]), top)
 
 def fmt_waltrace():
     cnt = watchdog_restart_count()
-    last = last_watchdog_action() or "нет записей"
+    last = last_watchdog_action() or tr("wd_none")
     age = watchdog_action_age()
     if age is not None and age > WATCHDOG_FRESH_SEC:
-        last += "\n⚠️ запись старая (%s назад)" % (
-            "%d ч" % int(age // 3600) if age >= 3600 else "%d мин" % int(age // 60))
-    L = ["Watchdog-и ноды"]
+        last += tr("wd_stale") % (
+            tr("t_hours") % int(age // 3600) if age >= 3600 else tr("t_mins") % int(age // 60))
+    L = [tr("wd_title")]
     for p in WATCHDOG_LOGS:
         mt = sh("stat -c %%Y %s 2>/dev/null" % p)
         name = os.path.basename(p).replace(".log", "")
         if not mt.isdigit():
-            L.append("  %s: лога нет" % name)
+            L.append(tr("wd_nolog") % name)
         else:
             a = int(time.time() - int(mt))
-            state = "живой" if a <= 1800 else "МОЛЧИТ"
-            L.append("  %s: %s, запись %d мин назад" % (name, state, a // 60))
-    L.append("Всего авто-рестартов: %s" % ("н/д" if cnt is None else cnt))
+            state = tr("wd_alive") if a <= 1800 else tr("wd_quiet")
+            L.append(tr("wd_entry") % (name, state, a // 60))
+    L.append(tr("wd_total") % (tr("na") if cnt is None else cnt))
     # Флуд waltrace оставлен как диагностика на случай регрессии: баг починен в 0.15.2
     # (cleanup-скрипт больше не удаляет wal_* из-под потока), сейчас должен быть 0.
-    L.append("Флуд waltrace за 5 мин: %s (баг починен в 0.15.2, ожидается 0)"
+    L.append(tr("wd_flood")
              % sh("journalctl -u monad-bft --since '5 min ago' --no-pager 2>/dev/null | grep -c 'waltrace thread stopped'"))
     need = watchdog_needs_attention()
     if need:
-        L.append("🔴 ТРЕБУЕТ ВМЕШАТЕЛЬСТВА:\n  %s" % need)
-    L.append("Последнее действие:\n%s" % last)
+        L.append(tr("wd_need") % need)
+    L.append(tr("wd_last") % last)
     return "\n".join(L)
 
 def fmt_node():
@@ -574,17 +691,9 @@ def fmt_node():
     # Префикс сжатого secp256k1-ключа — 02 ИЛИ 03, в зависимости от чётности Y. Шаблон ловил
     # только 02, то есть ровно половину сети: на живой ноде 94 против 196 уникальных пиров.
     peers = sh("journalctl -u monad-bft --since '1 min ago' --no-pager 2>/dev/null | grep -oE 'node_id\":\"0[23][0-9a-f]{6}' | sort -u | wc -l")
-    return ("Нода %s\nВерсия: %s\nmonad-bft с: %s\nУникальных пиров в логе/мин: %s"
-            % (HOST, node_version(), up, peers))
+    return tr("nd_body") % (HOST, node_version(), up, peers)
 
-HELP = ("Monad node bot — %s\n\n"
-        "/status — общая сводка\n"
-        "/sync — статус синхронизации\n"
-        "/disk — диск/ресурсы\n"
-        "/waltrace — watchdog/waltrace\n"
-        "/node — версия/аптайм/пиры\n"
-        "/id — показать chat id\n"
-        "/help — помощь" % HOST)
+
 
 # ---------- state & alerts ----------
 def load_state():
@@ -613,9 +722,9 @@ def monitor(st):
         prev_active = st.get("active_" + s)
         prev_start  = st.get("start_" + s)
         if prev_active is True and active is False:
-            alerts.append("🔴 СЕРВИС УПАЛ: %s неактивен!" % s)
+            alerts.append(tr("a_svc_down") % s)
         elif prev_active is False and active is True:
-            alerts.append("✅ Сервис восстановлен: %s снова active" % s)
+            alerts.append(tr("a_svc_up") % s)
         # crash-loop: NRestarts растёт, даже если фаза опроса всё время «здоровая»
         nr = svc_restarts(s)
         prev_nr = st.get("nrestarts_" + s)
@@ -623,24 +732,24 @@ def monitor(st):
             if prev_nr is not None and nr > prev_nr:
                 delta = nr - prev_nr
                 if delta >= CRASHLOOP_RESTARTS:
-                    alerts.append("🔴 CRASH-LOOP: %s перезапущен systemd %d раз(а) за цикл (всего %d)"
+                    alerts.append(tr("a_crashloop")
                                   % (s, delta, nr))
                 else:
-                    alerts.append("🟡 %s перезапущен systemd (%d раз всего)" % (s, nr))
+                    alerts.append(tr("a_sysrest") % (s, nr))
             st["nrestarts_" + s] = nr
         if prev_start and start and start != prev_start and active:
             wd = recent_watchdog_action()
-            tag = " (watchdog/waltrace — ожидаемо)" if (s == "monad-bft" and wd and "restart" in wd.lower()) else ""
-            alerts.append("🔄 РЕСТАРТ: %s перезапущен%s\nстарт: %s" % (s, tag, start))
+            tag = tr("a_expected") if (s == "monad-bft" and wd and "restart" in wd.lower()) else ""
+            alerts.append(tr("a_restart") % (s, tag, start))
         st["active_" + s] = active
         st["start_" + s]  = start
     # sync lag
     s = get_sync()
     rpc_dead = s["height"] is None
     if rpc_dead and not st.get("rpc_dead"):
-        alerts.append("🔴 RPC :8080 не отвечает")
+        alerts.append(tr("a_rpc_down"))
     elif not rpc_dead and st.get("rpc_dead"):
-        alerts.append("✅ RPC :8080 снова отвечает")
+        alerts.append(tr("a_rpc_up"))
     st["rpc_dead"] = rpc_dead
     # lag берётся только из eth_getBlockByNumber. Его таймаут при живом eth_blockNumber давал
     # lag=None → behind=False → «✅ Синк восстановлен (lag None)» посреди реального отставания,
@@ -651,9 +760,9 @@ def monitor(st):
     else:
         behind = s["lag"] > SYNC_LAG_WARN
         if behind and not st.get("behind"):
-            alerts.append("🟡 ОТСТАВАНИЕ СИНКА: lag %ds (блок %s)" % (s["lag"], s["height"]))
+            alerts.append(tr("a_lag") % (s["lag"], s["height"]))
         elif not behind and st.get("behind"):
-            alerts.append("✅ Синк восстановлен (lag %ds)" % s["lag"])
+            alerts.append(tr("a_lag_ok") % s["lag"])
         st["behind"] = behind
     # БЛОК НЕ РАСТЁТ (урок инцидента 2026-07-19: 5ч фриза с одним тихим алертом)
     h = s["height"]
@@ -662,25 +771,25 @@ def monitor(st):
             st["stall_ticks"] = st.get("stall_ticks", 0) + 1
         else:
             if st.get("stalled"):
-                alerts.append("✅ Блоки снова растут: %s" % h)
+                alerts.append(tr("a_stuck_ok") % h)
             st["stall_ticks"] = 0
             st["stalled"] = False
         if st.get("stall_ticks", 0) >= STALL_TICKS and not st.get("stalled"):
-            alerts.append("🔴 БЛОКИ НЕ РАСТУТ: высота застряла на %s (~%d мин). Consensus стоит!"
+            alerts.append(tr("a_stuck")
                           % (h, st["stall_ticks"] * CHECK_INTERVAL // 60))
             st["stalled"] = True
         st["last_height"] = h
     # РЕ-АЛЕРТ критических состояний каждые REALERT_SEC (не молчать часами!)
     now = time.time()
     crit = []
-    if st.get("stalled"):  crit.append("🔴 ВСЁ ЕЩЁ СТОИТ: блок %s не растёт" % st.get("last_height"))
-    if st.get("rpc_dead"): crit.append("🔴 RPC всё ещё не отвечает")
+    if st.get("stalled"):  crit.append(tr("a_stuck_still") % st.get("last_height"))
+    if st.get("rpc_dead"): crit.append(tr("a_rpc_still"))
     for svc in SERVICES:
         if st.get("active_" + svc) is False:
-            crit.append("🔴 %s всё ещё down" % svc)
+            crit.append(tr("a_svc_still") % svc)
     if crit:
         if now - st.get("last_realert", 0) >= REALERT_SEC:
-            alerts.append("⏰ НАПОМИНАНИЕ (повтор каждые %d мин):\n" % (REALERT_SEC // 60)
+            alerts.append(tr("a_reminder") % (REALERT_SEC // 60)
                           + "\n".join(crit))
             st["last_realert"] = now
     else:
@@ -695,10 +804,10 @@ def monitor(st):
         _n = int(wt)
         flooding = _n >= WALTRACE_FLOOD_5MIN
         if flooding and not st.get("waltrace_flood"):
-            alerts.append("🔴 ФЛУД waltrace: %d строк «waltrace thread stopped» за 5 мин. "
-                          "Поток waltrace мёртв, журнал забивается. Лечится рестартом monad-bft." % _n)
+            # a_flood carries the %d, a_flood2 is the explanation appended to it.
+            alerts.append((tr("a_flood") + tr("a_flood2")) % _n)
         elif not flooding and st.get("waltrace_flood"):
-            alerts.append("✅ Флуд waltrace прекратился (%d за 5 мин)" % _n)
+            alerts.append(tr("a_flood_ok") % _n)
         st["waltrace_flood"] = flooding
 
     # disk
@@ -706,10 +815,10 @@ def monitor(st):
     if d["pct"] is not None:
         warn = d["pct"] >= DISK_WARN_PCT
         if warn and not st.get("disk_warn"):
-            alerts.append("🟡 ДИСК: %s занят на %d%% (%s ГБ свободно)"
+            alerts.append(tr("a_disk")
                           % (d.get("mount", "/"), d["pct"], d["avail_gb"]))
         elif not warn and st.get("disk_warn"):
-            alerts.append("✅ Диск ок: %d%% занято" % d["pct"])
+            alerts.append(tr("a_disk_ok") % d["pct"])
         st["disk_warn"] = warn
 
     # Пересылка алертов Prometheus. Только транзишны: новый фаерящийся алерт и его снятие,
@@ -723,15 +832,15 @@ def monitor(st):
             icon = "🔴" if sev == "critical" else "🟡"
             alerts.append("%s PROMETHEUS [%s]: %s\n%s" % (icon, sev or "?", k, summ))
         for k in sorted(prev - set(cur)):
-            alerts.append("✅ PROMETHEUS: снят алерт %s" % k)
+            alerts.append(tr("a_prom_clr") % k)
         st["prom_alerts"] = sorted(cur)
         if st.get("prom_down"):
-            alerts.append("✅ Prometheus снова отвечает")
+            alerts.append(tr("a_prom_up"))
             st["prom_down"] = False
     elif not st.get("prom_down"):
         # Недоступный Prometheus = мы ослепли по половине сигналов. Раньше об этом никто
         # не узнавал, потому что бот про Prometheus вообще не знал.
-        alerts.append("🟡 Prometheus не отвечает — алерты по метрикам не отслеживаются")
+        alerts.append(tr("a_prom_down"))
         st["prom_down"] = True
 
     # Счётчик авто-рестартов watchdog. None = лог недоступен: состояние НЕ трогаем, иначе
@@ -746,7 +855,7 @@ def monitor(st):
             st["wd_count_schema"] = 2
         prev_cnt = st.get("wd_count")
         if prev_cnt is not None and cnt > prev_cnt:
-            alerts.append("⚠️ WATCHDOG: сделан авто-рестарт ноды (всего: %d)\n%s"
+            alerts.append(tr("a_wd_rest")
                           % (cnt, last_watchdog_action()))
         st["wd_count"] = cnt
 
@@ -754,7 +863,7 @@ def monitor(st):
     # автоматика сдалась. Раньше оно вообще не покидало лог.
     need = watchdog_needs_attention()
     if need and st.get("wd_alert_line") != need:
-        alerts.append("🔴🔴 WATCHDOG СДАЛСЯ — нужно вмешательство вручную:\n%s" % need)
+        alerts.append(tr("a_wd_gave") % need)
         st["wd_alert_line"] = need
 
     # Мёртвый watchdog = нода без авто-восстановления. Раньше его остановка была невидима.
@@ -763,11 +872,11 @@ def monitor(st):
         # Watchdog на этом хосте не установлен — тишина ожидаема, состояние не трогаем.
         pass
     elif not alive and not st.get("wd_dead"):
-        alerts.append("🟡 WATCHDOG молчит: логи не обновлялись %s — проверь cron"
-                      % ("никогда" if wd_age is None else "%d мин" % int(wd_age // 60)))
+        alerts.append(tr("a_wd_quiet")
+                      % (tr("t_never") if wd_age is None else tr("t_mins") % int(wd_age // 60)))
         st["wd_dead"] = True
     elif alive and st.get("wd_dead"):
-        alerts.append("✅ WATCHDOG снова пишет в лог")
+        alerts.append(tr("a_wd_back"))
         st["wd_dead"] = False
 
     if alerts:
@@ -785,8 +894,16 @@ def dispatch(cid, cmd):
     elif cmd == "disk":   send(cid, fmt_disk(), kb=True)
     elif cmd == "waltrace": send(cid, fmt_waltrace(), kb=True)
     elif cmd == "node":   send(cid, fmt_node(), kb=True)
-    elif cmd == "help":   send(cid, HELP, kb=True)
-    else: send(cid, "Неизвестная команда. /help", kb=True)
+    elif cmd == "help":   send(cid, tr("help") % HOST, kb=True)
+    elif cmd == "lang":
+        # Cycle EN -> RU -> DE. Show the full help right away: Telegram does not re-render
+        # earlier messages, so a bare confirmation looks like nothing changed.
+        global _lang
+        order = ["en", "ru", "de"]
+        _lang = order[(order.index(_lang) + 1) % len(order)] if _lang in order else "en"
+        st = load_state(); st["lang"] = _lang; save_state(st)
+        send(cid, tr("m_lang") + "\n\n" + tr("help") % HOST, kb=True)
+    else: send(cid, tr("m_unknown"), kb=True)
 
 def handle(msg):
     chat = msg.get("chat", {})
@@ -796,11 +913,10 @@ def handle(msg):
         return
     cmd = text.split()[0].lstrip("/").split("@")[0].lower()
     if cmd in ("id", "start"):
-        send(cid, "chat_id: %s\nДобавь его в ALLOWED_CHAT_IDS в config.env и перезапусти сервис.\n\n%s"
-                  % (cid, HELP if cid in ALLOWED else ""), kb=cid in ALLOWED)
+        send(cid, tr("m_chatid") % (cid, tr("help") % HOST if cid in ALLOWED else ""), kb=cid in ALLOWED)
         return
     if cid not in ALLOWED:
-        send(cid, "⛔ Не авторизован. Твой chat_id: %s" % cid)
+        send(cid, tr("m_unauth") % cid)
         return
     dispatch(cid, cmd)
 
@@ -814,7 +930,7 @@ def handle_callback(cb):
     sys.stderr.write("callback data=%s answer_ok=%s answer_took=%.1fs\n"
                      % (cb.get("data"), (r or {}).get("ok"), time.time() - t0))
     if cid not in ALLOWED:
-        send(cid, "⛔ Не авторизован. Твой chat_id: %s" % cid)
+        send(cid, tr("m_unauth") % cid)
         return
     # дебаунс: та же кнопка не чаще раза в 10с — гасит спам при серии нажатий
     # и при пачке протухших колбэков после залипания доставки. Отвечаем ВСЕГДА,
@@ -834,12 +950,16 @@ def handle_callback(cb):
 # ---------- main loop ----------
 def main():
     if not TOKEN:
-        sys.stderr.write("BOT_TOKEN не задан в %s — выход\n" % CFG_PATH); sys.exit(1)
+        # Printed before the language setting is read, so it stays English.
+        sys.stderr.write("BOT_TOKEN is not set in %s — exiting\n" % CFG_PATH); sys.exit(1)
     st = load_state()
+    # Restore the language chosen with /lang across restarts; config LANG is the fallback.
+    global _lang
+    _lang = st.get("lang", DEFAULT_LANG)
     offset = st.get("offset", 0)
     # init service baselines so first tick doesn't false-alarm
     monitor(st)
-    broadcast("🤖 monad-tg-bot запущен на %s. /help — команды." % HOST)
+    broadcast(tr("m_started") % HOST)
     last_check = time.time()
     while True:
         tp = time.time()
