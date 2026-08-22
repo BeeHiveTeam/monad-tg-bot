@@ -46,6 +46,7 @@ Install elsewhere with `MONAD_BOT_DIR=/path`.
 | `/disk` | disk usage of `/` |
 | `/waltrace` | watchdog auto-restart count, recent flood, last action |
 | `/node` | node version, uptime, peer count |
+| `/validator` | registry id, self stake, commission, active-set membership — or an explicit "could not check", which is not the same as "not a validator" |
 | `/id` | reply with your chat id (for first-time setup) |
 | `/help` | command list |
 

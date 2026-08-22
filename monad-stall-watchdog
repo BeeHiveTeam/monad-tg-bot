@@ -12,8 +12,10 @@
 # Cron: */5 * * * * /usr/local/bin/monad-stall-watchdog >> /var/log/monad-stall-watchdog.log 2>&1
 
 set -u
-RPC=http://localhost:8080
-STATE=/var/lib/monad-stall-watchdog.state
+# Переопределяемы, как и пороги ниже: иначе скрипт нельзя прогнать на подставном RPC, и любая
+# проверка веток бьёт по боевой ноде.
+RPC=${RPC:-http://localhost:8080}
+STATE=${STATE:-/var/lib/monad-stall-watchdog.state}
 STALL_MIN=${STALL_MIN:-15}
 GRACE_MIN=${GRACE_MIN:-20}
 COOLDOWN_MIN=${COOLDOWN_MIN:-60}
@@ -29,9 +31,11 @@ if [ $((NOW - START_EPOCH)) -lt $((GRACE_MIN * 60)) ]; then
   echo "$(TS) SKIP — сервис моложе ${GRACE_MIN} мин (statesync-грейс)"; exit 0
 fi
 
+# Пробелы вокруг двоеточия допустимы в JSON: шаблон без них молча превращал любой ответ
+# форматирующего сервера в «RPC пуст» и отключал сторож насовсем.
 HEX=$(curl -s --max-time 8 -X POST $RPC -H 'Content-Type: application/json' \
   --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' 2>/dev/null \
-  | grep -oE '"result":"0x[0-9a-f]+"' | grep -oE '0x[0-9a-f]+')
+  | grep -oE '"result"[[:space:]]*:[[:space:]]*"0x[0-9a-f]+"' | grep -oE '0x[0-9a-f]+')
 if [ -z "$HEX" ]; then
   echo "$(TS) NO-DATA — RPC пуст (statesync?), stall не считаем"; exit 0
 fi
@@ -54,6 +58,48 @@ fi
 if [ $((NOW - LAST_RESTART)) -lt $((COOLDOWN_MIN * 60)) ]; then
   echo "$(TS) ALERT — stall $((STUCK_SEC / 60)) мин, но cooldown ${COOLDOWN_MIN} мин не истёк. НУЖНО ВМЕШАТЕЛЬСТВО ВРУЧНУЮ."
   exit 0
+fi
+
+# ---- гейт валидатора ----------------------------------------------------------
+# На фулл-ноде рестарт безобиден. На валидаторе В АКТИВНОМ СЕТЕ рестарт, попавший в наш слот
+# предложения, стоит пропущенных блоков. Признак берём документированный: метрика
+# monad_state_node_state_self_stake_bps («Self stake in basis points»), >0 = мы в сете.
+# НЕ beneficiary из node.toml: это адрес выплат, он есть и у фулл-ноды, и у валидатора вне сета.
+#
+# Формат Prometheus: `имя{метки} значение [timestamp_ms]`, третье поле необязательно. Берём
+# ВТОРОЕ поле, а не последнее: у коллектора последнее — timestamp (~1.8e12), и нода с нулевым
+# стейком была бы объявлена активным валидатором.
+NODE_METRICS=${NODE_METRICS:-http://127.0.0.1:9143/metrics}
+VSTATE=${VSTATE:-/var/lib/monad-stall-watchdog.validator}
+
+BPS=$(curl -s --max-time 5 "$NODE_METRICS" 2>/dev/null \
+  | grep -E '^monad_state_node_state_self_stake_bps([{ ]|$)' | tr -d '\r' \
+  | sed 's/{[^}]*}//' | awk '{print $2}')
+BPS_LINES=$(printf '%s' "$BPS" | grep -c . || true)
+
+if [ "$BPS_LINES" = "1" ] && printf '%s' "$BPS" | grep -qE '^[0-9]+(\.[0-9]+)?$'; then
+  if [ "${BPS%%.*}" -gt 0 ] 2>/dev/null; then
+    # Один раз увидев себя в сете, запоминаем: дальше молчание метрик трактуем осторожно.
+    echo 1 > "$VSTATE" 2>/dev/null || true
+    if [ "${ALLOW_VALIDATOR_RESTART:-0}" != "1" ]; then
+      echo "$(TS) BLOCKED — self_stake_bps=$BPS: нода В АКТИВНОМ СЕТЕ, рестарт может стоить блоков."
+      echo "$(TS)   stall $((STUCK_SEC / 60)) мин. НУЖНО ВМЕШАТЕЛЬСТВО ВРУЧНУЮ (или ALLOW_VALIDATOR_RESTART=1)."
+      exit 0
+    fi
+    echo "$(TS) WARN — активный валидатор, но ALLOW_VALIDATOR_RESTART=1: перезапускаю намеренно."
+  else
+    echo 0 > "$VSTATE" 2>/dev/null || true
+  fi
+else
+  # Метрику прочитать не смогли. Это НЕ ноль: молчать про неизвестность и перезапускать вслепую
+  # нельзя, если нода уже бывала в сете. Если не бывала — глушить восстановление на фулл-ноде
+  # из-за упавшего эндпоинта тоже неправильно: чиним то, ради чего сторож и создан, но громко.
+  if [ "$(cat "$VSTATE" 2>/dev/null)" = "1" ] && [ "${ALLOW_VALIDATOR_RESTART:-0}" != "1" ]; then
+    echo "$(TS) BLOCKED — self_stake_bps не прочитан, а нода РАНЕЕ была в активном сете."
+    echo "$(TS)   stall $((STUCK_SEC / 60)) мин. НУЖНО ВМЕШАТЕЛЬСТВО ВРУЧНУЮ (или ALLOW_VALIDATOR_RESTART=1)."
+    exit 0
+  fi
+  echo "$(TS) ALERT — self_stake_bps не прочитан ($NODE_METRICS); в активном сете нода не бывала — перезапускаю."
 fi
 
 echo "$(TS) ACTION — блок $H не растёт $((STUCK_SEC / 60)) мин: restarting monad-bft"

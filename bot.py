@@ -11,8 +11,10 @@ Runs as root (needs systemctl/journalctl/df and the root-owned watchdog log).
 """
 import calendar, json, os, re, ssl, subprocess, sys, time, urllib.parse, urllib.request
 
-CFG_PATH   = "/opt/monad-tg-bot/config.env"
-STATE_PATH = "/opt/monad-tg-bot/state.json"
+# Пути переопределяемы окружением: иначе бота нельзя ни прогнать на тестовой конфигурации,
+# ни поставить в раскладку, отличную от нашей. Умолчания прежние.
+CFG_PATH   = os.environ.get("MONAD_TG_BOT_CONFIG", "/opt/monad-tg-bot/config.env")
+STATE_PATH = os.environ.get("MONAD_TG_BOT_STATE", "/opt/monad-tg-bot/state.json")
 # Логи watchdog-ов. Исторически бот знал только про waltrace-watchdog, но баг waltrace
 # починен апстримом в monad 0.15.2, и этот watchdog снят с cron — его лог заморожен навсегда.
 # Живой сейчас monad-stall-watchdog (зависание консенсуса, урок инцидента 2026-07-19), и его
@@ -127,6 +129,23 @@ T = {
   "b_node":   {"en": "🖥 Node",    "ru": "🖥 Нода",     "de": "🖥 Node"},
   "b_help":   {"en": "❓ Help",     "ru": "❓ Помощь",   "de": "❓ Hilfe"},
   "b_lang":   {"en": "🌐 EN",      "ru": "🌐 RU",       "de": "🌐 DE"},
+  "b_val":    {"en": "🏛 Validator", "ru": "🏛 Валидатор", "de": "🏛 Validator"},
+
+  # validator
+  "vl_title":  {"en": "🏛 Validator #%s", "ru": "🏛 Валидатор #%s", "de": "🏛 Validator #%s"},
+  "vl_stake":  {"en": "Self stake: %s MON", "ru": "Свой стейк: %s MON", "de": "Eigener Stake: %s MON"},
+  "vl_comm":   {"en": "Commission: %.2f%%", "ru": "Комиссия: %.2f%%", "de": "Provision: %.2f%%"},
+  "vl_auth":   {"en": "Auth address: %s", "ru": "Адрес auth: %s", "de": "Auth-Adresse: %s"},
+  "vl_set_in": {"en": "Active set: ✅ in (self stake %.2f%%)", "ru": "Активный сет: ✅ внутри (свой стейк %.2f%%)", "de": "Aktives Set: ✅ drin (Eigenanteil %.2f%%)"},
+  "vl_set_out":{"en": "Active set: — registered, not yet in", "ru": "Активный сет: — зарегистрирован, ещё не вошли", "de": "Aktives Set: — registriert, noch nicht drin"},
+  "vl_set_unknown": {"en": "Active set: ❔ could not read self_stake_bps", "ru": "Активный сет: ❔ не смог прочитать self_stake_bps", "de": "Aktives Set: ❔ self_stake_bps nicht lesbar"},
+  "vl_none":   {"en": "🏛 Not a validator — this node's key is in none of the %s registry entries (full node).", "ru": "🏛 Не валидатор — ключа этой ноды нет ни в одной из %s записей реестра (фулл-нода).", "de": "🏛 Kein Validator — der Schlüssel dieser Node fehlt in allen %s Registry-Einträgen (Full Node)."},
+  "vl_unknown":{"en": "🏛 Validator status unknown — %s. This is not the same as \"not a validator\".", "ru": "🏛 Статус валидатора неизвестен — %s. Это НЕ то же, что «не валидатор».", "de": "🏛 Validator-Status unbekannt — %s. Das heißt nicht \"kein Validator\"."},
+  "vl_why_otel":  {"en": "the metrics collector did not answer", "ru": "коллектор метрик не ответил", "de": "der Metrik-Collector antwortete nicht"},
+  "vl_why_nolabel": {"en": "the collector publishes no secp_key label", "ru": "коллектор не публикует метку secp_key", "de": "der Collector veröffentlicht kein secp_key-Label"},
+  "vl_why_many":  {"en": "the collector reports more than one secp_key", "ru": "коллектор отдаёт больше одного secp_key", "de": "der Collector meldet mehr als einen secp_key"},
+  "vl_why_rpc":   {"en": "the staking precompile did not answer", "ru": "прекомпайл стейкинга не ответил", "de": "das Staking-Precompile antwortete nicht"},
+  "vl_why_budget":{"en": "the registry scan hit its call budget", "ru": "обход реестра упёрся в бюджет вызовов", "de": "der Registry-Scan erreichte sein Aufrufbudget"},
 
   # sync state
   "s_nolag":  {"en": "❔ lag not measured", "ru": "❔ lag не измерен", "de": "❔ Lag nicht messbar"},
@@ -208,14 +227,17 @@ T = {
   "help":       {"en": ("Monad node bot — %s\n\n"
                         "/status — overview\n/sync — sync state\n/disk — disk and resources\n"
                         "/waltrace — watchdog/waltrace\n/node — version/uptime/peers\n"
+                        "/validator — registry id, self stake, commission\n"
                         "/id — show chat id\n/lang — switch language\n/help — this message"),
                  "ru": ("Monad node bot — %s\n\n"
                         "/status — общая сводка\n/sync — статус синхронизации\n/disk — диск/ресурсы\n"
                         "/waltrace — watchdog/waltrace\n/node — версия/аптайм/пиры\n"
+                        "/validator — id в реестре, свой стейк, комиссия\n"
                         "/id — показать chat id\n/lang — сменить язык\n/help — помощь"),
                  "de": ("Monad node bot — %s\n\n"
                         "/status — Übersicht\n/sync — Sync-Status\n/disk — Platte und Ressourcen\n"
                         "/waltrace — Watchdog/waltrace\n/node — Version/Laufzeit/Peers\n"
+                        "/validator — Registry-ID, Eigen-Stake, Provision\n"
                         "/id — chat id anzeigen\n/lang — Sprache wechseln\n/help — diese Nachricht")},
 }
 
@@ -230,6 +252,7 @@ def keyboard():
         [{"text": tr("b_status"), "callback_data": "status"}, {"text": tr("b_sync"), "callback_data": "sync"}],
         [{"text": tr("b_disk"), "callback_data": "disk"}, {"text": tr("b_wal"), "callback_data": "waltrace"}],
         [{"text": tr("b_node"), "callback_data": "node"}, {"text": tr("b_help"), "callback_data": "help"}],
+        [{"text": tr("b_val"), "callback_data": "validator"}],
         [{"text": tr("b_lang"), "callback_data": "lang"}],
     ]})
 
@@ -594,6 +617,211 @@ def node_version():
     m = re.search(r'"tag":"([^"]+)"', v)
     return m.group(1) if m else (v[:40] or "?")
 
+# ---------- validator (staking precompile) ----------
+# Роль ноды — это НЕ то же самое, что наличие ключей на диске. Полноценных состояний три:
+# нода зарегистрирована и в активном сете, зарегистрирована и ждёт стейка, не зарегистрирована
+# вовсе. Плюс четвёртое, отдельное: проверить не смогли. Последнее нельзя показывать как «нулевой
+# стейк» — это выдуманный ответ.
+STAKING_PRECOMPILE = "0x0000000000000000000000000000000000001000"
+GET_VALIDATOR_SEL = "0x2b6d639a"
+# Метка secp_key есть только у коллектора; сама нода на :9143 её не публикует. Зато self_stake_bps
+# есть у ноды. Поэтому два разных источника, а не один.
+OTEL_METRICS = CFG.get("OTEL_METRICS", os.environ.get("OTEL_METRICS", "http://127.0.0.1:8889/metrics"))
+NODE_METRICS = CFG.get("NODE_METRICS", os.environ.get("NODE_METRICS", "http://127.0.0.1:9143/metrics"))
+VAL_CACHE = CFG.get("VAL_CACHE", "/opt/monad-tg-bot/validator.json")
+VAL_SCAN_BUDGET = int(CFG.get("VAL_SCAN_BUDGET", "400"))
+
+
+def _metrics_text(url, timeout=5):
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.read().decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
+def node_secp():
+    """(ключ, причина_отказа). Ровно один из двух не None.
+
+    Причины разделены намеренно: «коллектор не отвечает», «метки нет вовсе» и «ключей несколько»
+    чинятся по-разному, и слить их в одно «не смог» значит отправить оператора искать вслепую.
+    Несколько ключей — это тоже отказ: какой из них наш, неизвестно, а угадывать нельзя.
+    """
+    txt = _metrics_text(OTEL_METRICS)
+    if txt is None:
+        return None, "otel"
+    keys = {k.lower() for k in re.findall(r'secp_key="([0-9a-fA-F]{66})"', txt)}
+    if not keys:
+        return None, "nolabel"
+    if len(keys) > 1:
+        return None, "many"
+    return keys.pop(), None
+
+
+def self_stake_bps():
+    """(значение, удалось_ли). >0 = нода в активном сете валидаторов.
+
+    Формат Prometheus: `имя{метки} значение [timestamp_ms]`, где третье поле НЕОБЯЗАТЕЛЬНО.
+    Нода его не ставит, коллектор ставит. Взять последнее поле значит на одном из двух источников
+    прочитать timestamp (~1.8e12) и объявить активным валидатором ноду с нулевым стейком.
+    Поэтому: срезаем метки и берём второе поле — значение в обоих случаях.
+    """
+    txt = _metrics_text(NODE_METRICS)
+    if txt is None:
+        return None, False
+    vals = []
+    for line in txt.splitlines():
+        if line.startswith("#") or not line.startswith("monad_state_node_state_self_stake_bps"):
+            continue
+        parts = re.sub(r"\{[^}]*\}", "", line).split()
+        if len(parts) >= 2:
+            try:
+                vals.append(float(parts[1]))
+            except ValueError:
+                pass
+    if len(vals) != 1:
+        return None, False
+    return vals[0], True
+
+
+def _word(h, i):
+    return int(h[i * 64:(i + 1) * 64], 16)
+
+
+def _get_validator(vid):
+    """Слова ответа get_validator(vid), или None если вызов не удался."""
+    res = rpc("eth_call", [{"to": STAKING_PRECOMPILE,
+                            "data": GET_VALIDATOR_SEL + ("%064x" % vid)}, "latest"])
+    if not isinstance(res, str) or len(res) < 2 + 64 * 12:
+        return None
+    return res[2:]
+
+
+def _val_secp(h):
+    """Ключ из динамической части ответа. Смещения лежат в словах 10 и 11."""
+    o = _word(h, 10) // 32
+    n = _word(h, o)
+    return h[(o + 1) * 64:(o + 1) * 64 + n * 2].lower()
+
+
+def _registered(h):
+    return h is not None and _word(h, 0) != 0
+
+
+def _registry_top(spent):
+    """Наибольший занятый id: удвоение, затем деление пополам.
+
+    Номера выдаются по порядку, поэтому недавно зарегистрированная нода лежит у самой верхушки —
+    поиск вниз отсюда находит её за единицы вызовов вместо обхода всего реестра.
+    """
+    hi = 1
+    while _registered(_get_validator(hi)) and hi < 1 << 20:
+        spent[0] += 1
+        hi *= 2
+    spent[0] += 1
+    lo = hi // 2
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        spent[0] += 1
+        if _registered(_get_validator(mid)):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def _cache_read():
+    try:
+        with open(VAL_CACHE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _cache_write(obj):
+    try:
+        os.makedirs(os.path.dirname(VAL_CACHE), exist_ok=True)
+        tmp = VAL_CACHE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(obj, f)
+        os.replace(tmp, VAL_CACHE)
+    except Exception:
+        pass
+
+
+def validator_lookup():
+    """('validator'|'none'|'unknown', info).
+
+    'unknown' — это НЕ 'none'. Нода с недоступным коллектором или молчащим RPC не была показана
+    незарегистрированной; сказать про неё «стейк 0» значит придумать ответ.
+    """
+    secp, why = node_secp()
+    if not secp:
+        return "unknown", {"why": why}
+
+    cached = _cache_read()
+    if cached.get("secp") == secp and isinstance(cached.get("id"), int):
+        h = _get_validator(cached["id"])
+        if h is None:
+            return "unknown", {"why": "rpc"}
+        # Кеш подтверждаем ключом, а не принимаем на веру: id могли перерегистрировать.
+        if _registered(h) and _val_secp(h) == secp:
+            return "validator", _describe(cached["id"], h)
+
+    spent = [0]
+    top = _registry_top(spent)
+    if top < 1:
+        return "unknown", {"why": "rpc"}
+    for vid in range(top, 0, -1):
+        if spent[0] >= VAL_SCAN_BUDGET:
+            # Бюджет исчерпан — это «не досмотрели», а не «не нашли».
+            return "unknown", {"why": "budget", "scanned": spent[0], "top": top}
+        spent[0] += 1
+        h = _get_validator(vid)
+        if h is None:
+            return "unknown", {"why": "rpc"}
+        if _registered(h) and _val_secp(h) == secp:
+            _cache_write({"secp": secp, "id": vid})
+            return "validator", _describe(vid, h)
+    return "none", {"top": top}
+
+
+def _describe(vid, h):
+    """Только те поля, смысл которых подтверждён: стейк (w2) и комиссия (w4).
+
+    Остальные семь uint256 ABI не именует, и гадать о них в отчёте оператору нельзя.
+    Признак активного сета берём отдельно — из документированной метрики self_stake_bps.
+    """
+    bps, ok = self_stake_bps()
+    return {
+        "id": vid,
+        "stake": _word(h, 2) / 10 ** 18,
+        "commission": _word(h, 4) / 10 ** 16,
+        "auth": "0x" + h[24:64],
+        "bps": bps,
+        "bps_ok": ok,
+    }
+
+
+def fmt_validator():
+    state, info = validator_lookup()
+    if state == "unknown":
+        return tr("vl_unknown") % tr("vl_why_" + info.get("why", "rpc"))
+    if state == "none":
+        return tr("vl_none") % info.get("top", "?")
+    L = [tr("vl_title") % info["id"]]
+    L.append(tr("vl_stake") % format(info["stake"], ",.0f"))
+    L.append(tr("vl_comm") % info["commission"])
+    if not info["bps_ok"]:
+        L.append(tr("vl_set_unknown"))
+    elif info["bps"] > 0:
+        L.append(tr("vl_set_in") % (info["bps"] / 100.0))
+    else:
+        L.append(tr("vl_set_out"))
+    L.append(tr("vl_auth") % info["auth"])
+    return "\n".join(L)
+
+
 # ---------- formatted reports (for commands) ----------
 def sync_symbol(s):
     """
@@ -894,6 +1122,7 @@ def dispatch(cid, cmd):
     elif cmd == "disk":   send(cid, fmt_disk(), kb=True)
     elif cmd == "waltrace": send(cid, fmt_waltrace(), kb=True)
     elif cmd == "node":   send(cid, fmt_node(), kb=True)
+    elif cmd in ("validator", "val", "stake"): send(cid, fmt_validator(), kb=True)
     elif cmd == "help":   send(cid, tr("help") % HOST, kb=True)
     elif cmd == "lang":
         # Cycle EN -> RU -> DE. Show the full help right away: Telegram does not re-render
