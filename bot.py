@@ -11,6 +11,23 @@ Runs as root (needs systemctl/journalctl/df and the root-owned watchdog log).
 """
 import calendar, json, os, re, ssl, subprocess, sys, time, urllib.parse, urllib.request
 
+# --- IPv4 вперёд ---------------------------------------------------------------
+# api.telegram.org отдаёт и A, и AAAA. На хосте с глобальным IPv6, у которого маршрут до
+# Telegram не работает (наш случай на OVH), getaddrinfo ставит IPv6 первым, а urllib, в отличие
+# от curl, не умеет Happy Eyeballs: он перебирает адреса по порядку и на каждом ждёт ПОЛНЫЙ
+# таймаут. Замер: 2 запроса из 20 висли 5.7 и 24.7 с, при принудительном IPv4 — 0 из 20.
+# Наружу это выглядело как «кнопка не отвечает»: висел sendMessage, а не обработчик.
+# Не фильтруем, а переупорядочиваем — на хосте только с IPv6 список останется прежним.
+if os.environ.get("PREFER_IPV4", "1") != "0":
+    import socket as _socket
+    _orig_getaddrinfo = _socket.getaddrinfo
+
+    def _ipv4_first(*args, **kwargs):
+        res = _orig_getaddrinfo(*args, **kwargs)
+        return sorted(res, key=lambda r: 0 if r[0] == _socket.AF_INET else 1)
+
+    _socket.getaddrinfo = _ipv4_first
+
 # Пути переопределяемы окружением: иначе бота нельзя ни прогнать на тестовой конфигурации,
 # ни поставить в раскладку, отличную от нашей. Умолчания прежние.
 CFG_PATH   = os.environ.get("MONAD_TG_BOT_CONFIG", "/opt/monad-tg-bot/config.env")
@@ -132,6 +149,24 @@ T = {
   "b_val":    {"en": "🏛 Validator", "ru": "🏛 Валидатор", "de": "🏛 Validator"},
 
   # validator
+  "a_val_stake": {"en": "🏛 Validator stake changed: %s%s MON (%s -> %s)",
+                  "ru": "🏛 Стейк валидатора изменился: %s%s MON (%s -> %s)",
+                  "de": "🏛 Validator-Stake geändert: %s%s MON (%s -> %s)"},
+  "a_val_comm":  {"en": "⚠️ Validator commission changed: %.2f%% -> %.2f%%. Did you do this?",
+                  "ru": "⚠️ Комиссия валидатора изменилась: %.2f%% -> %.2f%%. Это делали вы?",
+                  "de": "⚠️ Validator-Provision geändert: %.2f%% -> %.2f%%. Waren Sie das?"},
+  "a_val_in":    {"en": "✅ Validator ENTERED the active set (self stake %.2f%%)",
+                  "ru": "✅ Валидатор ВОШЁЛ в активный сет (свой стейк %.2f%%)",
+                  "de": "✅ Validator IST im aktiven Set (Eigenanteil %.2f%%)"},
+  "a_val_out":   {"en": "🔴 Validator LEFT the active set — it no longer signs blocks",
+                  "ru": "🔴 Валидатор ВЫШЕЛ из активного сета — блоки больше не подписываются",
+                  "de": "🔴 Validator hat das aktive Set VERLASSEN — signiert keine Blöcke mehr"},
+  "a_val_id":    {"en": "⚠️ Validator id changed: #%s -> #%s. The node key was re-registered.",
+                  "ru": "⚠️ Изменился id валидатора: #%s -> #%s. Ключ ноды перерегистрирован.",
+                  "de": "⚠️ Validator-ID geändert: #%s -> #%s. Node-Key neu registriert."},
+  "a_val_gone":  {"en": "🔴 Validator #%s is no longer in the registry under this node's key",
+                  "ru": "🔴 Валидатора #%s больше нет в реестре под ключом этой ноды",
+                  "de": "🔴 Validator #%s ist nicht mehr mit dem Key dieser Node registriert"},
   "vl_title":  {"en": "🏛 Validator #%s", "ru": "🏛 Валидатор #%s", "de": "🏛 Validator #%s"},
   "vl_stake":  {"en": "Self stake: %s MON", "ru": "Свой стейк: %s MON", "de": "Eigener Stake: %s MON"},
   "vl_comm":   {"en": "Commission: %.2f%%", "ru": "Комиссия: %.2f%%", "de": "Provision: %.2f%%"},
@@ -628,7 +663,7 @@ GET_VALIDATOR_SEL = "0x2b6d639a"
 # есть у ноды. Поэтому два разных источника, а не один.
 OTEL_METRICS = CFG.get("OTEL_METRICS", os.environ.get("OTEL_METRICS", "http://127.0.0.1:8889/metrics"))
 NODE_METRICS = CFG.get("NODE_METRICS", os.environ.get("NODE_METRICS", "http://127.0.0.1:9143/metrics"))
-VAL_CACHE = CFG.get("VAL_CACHE", "/opt/monad-tg-bot/validator.json")
+VAL_CACHE = CFG.get("VAL_CACHE", os.environ.get("VAL_CACHE", "/opt/monad-tg-bot/validator.json"))
 VAL_SCAN_BUDGET = int(CFG.get("VAL_SCAN_BUDGET", "400"))
 
 
@@ -772,7 +807,20 @@ def validator_lookup():
     top = _registry_top(spent)
     if top < 1:
         return "unknown", {"why": "rpc"}
-    for vid in range(top, 0, -1):
+
+    # Отрицательный ответ тоже кешируется, иначе фулл-нода обходила бы весь реестр каждую минуту
+    # (сотни eth_call в тик). Ключа нет — значит его нет НИ В ОДНОЙ существующей записи; новые
+    # записи получают номера по возрастанию, поэтому досмотреть достаточно то, что появилось
+    # после прошлой проверки. Верхнюю границу ищем делением пополам, это единицы вызовов.
+    floor = 0
+    if cached.get("secp") == secp and cached.get("id") is None:
+        seen = cached.get("top")
+        if isinstance(seen, int):
+            if top <= seen:
+                return "none", {"top": top}
+            floor = seen
+
+    for vid in range(top, floor, -1):
         if spent[0] >= VAL_SCAN_BUDGET:
             # Бюджет исчерпан — это «не досмотрели», а не «не нашли».
             return "unknown", {"why": "budget", "scanned": spent[0], "top": top}
@@ -781,8 +829,9 @@ def validator_lookup():
         if h is None:
             return "unknown", {"why": "rpc"}
         if _registered(h) and _val_secp(h) == secp:
-            _cache_write({"secp": secp, "id": vid})
+            _cache_write({"secp": secp, "id": vid, "top": top})
             return "validator", _describe(vid, h)
+    _cache_write({"secp": secp, "id": None, "top": top})
     return "none", {"top": top}
 
 
@@ -937,6 +986,45 @@ def save_state(st):
 
 def monitor(st):
     alerts = []
+    # --- валидатор: стейк, комиссия, членство в активном сете ---------------------
+    # Сравниваем с прошлым тиком и сообщаем только об ИЗМЕНЕНИИ. Первое наблюдение всегда молчит:
+    # иначе бот бы кричал про «новый стейк» на каждом своём перезапуске.
+    # 'unknown' (коллектор молчит, прекомпайл не ответил) состояние НЕ трогает и алертов не даёт —
+    # это «не смогли посмотреть», а не «стало ноль».
+    v_state, v_info = validator_lookup()
+    if v_state == "validator":
+        prev_id = st.get("val_id")
+        if prev_id is not None and v_info["id"] != prev_id:
+            alerts.append(tr("a_val_id") % (prev_id, v_info["id"]))
+
+        prev_stake = st.get("val_stake")
+        if prev_stake is not None and v_info["stake"] != prev_stake:
+            delta = v_info["stake"] - prev_stake
+            alerts.append(tr("a_val_stake") % (
+                "+" if delta > 0 else "−", format(abs(delta), ",.0f"),
+                format(prev_stake, ",.0f"), format(v_info["stake"], ",.0f")))
+
+        prev_comm = st.get("val_commission")
+        # Комиссию меняем только мы. Изменение, которого мы не делали, — повод посмотреть, кто.
+        if prev_comm is not None and abs(v_info["commission"] - prev_comm) > 1e-9:
+            alerts.append(tr("a_val_comm") % (prev_comm, v_info["commission"]))
+
+        if v_info["bps_ok"]:
+            in_set = v_info["bps"] > 0
+            prev_in = st.get("val_in_set")
+            if prev_in is not None and in_set != prev_in:
+                alerts.append((tr("a_val_in") % (v_info["bps"] / 100.0)) if in_set else tr("a_val_out"))
+            st["val_in_set"] = in_set
+
+        st["val_id"] = v_info["id"]
+        st["val_stake"] = v_info["stake"]
+        st["val_commission"] = v_info["commission"]
+    elif v_state == "none" and st.get("val_id") is not None:
+        # Были в реестре, а теперь ключа там нет — это событие, а не тишина.
+        alerts.append(tr("a_val_gone") % st["val_id"])
+        for k in ("val_id", "val_stake", "val_commission", "val_in_set"):
+            st.pop(k, None)
+
     # services up/down + restart detection
     for s in SERVICES:
         active = svc_active(s)
@@ -1190,6 +1278,7 @@ def main():
     monitor(st)
     broadcast(tr("m_started") % HOST)
     last_check = time.time()
+    net_fail = 0
     while True:
         tp = time.time()
         # allowed_updates явно: настройка ПЕРСИСТЕНТНА на стороне Telegram —
@@ -1215,8 +1304,16 @@ def main():
                     except Exception as e:
                         sys.stderr.write("callback error: %s\n" % e)
             save_state(st)
+            net_fail = 0
         elif upd is not None:
+            net_fail = 0
             time.sleep(2)  # HTTP-ошибка API (401/409/429): не долбим в busy-loop
+        else:
+            # upd is None — не-HTTP сбой: DNS, обрыв, таймаут чтения. Паузы тут не было вовсе,
+            # и при быстром отказе (сеть легла) цикл крутился бы вплотную, забивая journald
+            # рядом с боевой нодой. Нарастающая пауза, как в provenance-tg-bot.
+            net_fail += 1
+            time.sleep(min(2 * (2 ** min(net_fail - 1, 4)), 60))  # 2,4,8,16, далее 32 с
         if time.time() - last_check >= CHECK_INTERVAL:
             try: monitor(st)
             except Exception as e:

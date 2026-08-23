@@ -47,6 +47,8 @@ Install elsewhere with `MONAD_BOT_DIR=/path`.
 | `/waltrace` | watchdog auto-restart count, recent flood, last action |
 | `/node` | node version, uptime, peer count |
 | `/validator` | registry id, self stake, commission, active-set membership — or an explicit "could not check", which is not the same as "not a validator" |
+
+The monitor loop also pushes an alert when the self stake changes, when the commission changes, when the node enters or leaves the active validator set, and when the node's key stops being registered. A reading it could not take is never reported as a change.
 | `/id` | reply with your chat id (for first-time setup) |
 | `/help` | command list |
 
