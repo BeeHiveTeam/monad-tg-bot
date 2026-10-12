@@ -217,7 +217,11 @@ if [ "$HAVE_SYSTEMD" -eq 1 ]; then
   fi
   $SUDO cp "$TMP/unit" "$UNIT"
   $SUDO systemctl daemon-reload
-  $SUDO systemctl enable --now "$SERVICE" >/dev/null 2>&1 || die "systemctl enable failed."
+  # enable + restart, not `enable --now`: on a re-run the service is already active, and starting
+  # an active unit is a no-op — the old bot kept running from memory while this script printed
+  # "running" and "Done". restart loads the bot.py and config just written, and starts it if stopped.
+  $SUDO systemctl enable "$SERVICE" >/dev/null 2>&1 || die "systemctl enable failed."
+  $SUDO systemctl restart "$SERVICE" >/dev/null 2>&1 || die "systemctl restart failed."
   sleep 3
   if $SUDO systemctl is-active --quiet "$SERVICE"; then
     ok "Service ${SERVICE} is running as ${RUN_USER}."
